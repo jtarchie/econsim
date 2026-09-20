@@ -131,6 +131,57 @@ Camera2D pan/zoom.
 - **Stale loan refs** after slot reuse: `(idx, gen)` pairs.
 - **Float drift in money**: avoided by integer-valued doubles.
 
+## Status (2026-09-20) — land ownership
+
+Prompted by noticing the world's "edges". Measurement first: movement already costs 1% of the food
+bill, mean speed is 0.4 units/tick so crossing half the map outlasts a lifetime, 92% of cells are
+empty and half of prime farmland is unoccupied. So the physical constraint was already crushing and
+the price of moving was irrelevant. What was missing was the *economic* constraint — nobody could be
+excluded from land, so land could not be a way to win or lose.
+
+- `own[cell]` names the owning slot, `cells[unit]` the same fact from the other side so a death can
+  find its own land without sweeping the map. Both sides are reconciled in `validate()`.
+- **Rent** in `phase_produce`: work a cell someone else owns and a `rent` share of what it yields,
+  valued at the market price, goes to the owner. Unpayable rent is simply not paid — arrears would
+  need a second credit system.
+- **Claiming** costs `land_price` in cash, paid to the commons. That barrier is the mechanism, not a
+  side effect: enclosure is something only the already-moneyed can do. A unit with `speculate > 0.5`
+  claims the best cell in its 3x3 block rather than the one under its feet, so land can be enclosed
+  ahead of anyone reaching it.
+- **Inheritance**: land passes whole to the heir, unsplit and untaxed by `estate_tax`.
+- **Foreclosure**: a default hands one of the borrower's cells to the lender.
+- New gene `land` (NG 20 -> 21) for claim appetite; `speculate` decides absentee vs occupied.
+- New channel `land` (NCHAN 9 -> 10): net lifetime rent collected, less rent paid and purchase fees.
+
+### Two bugs this surfaced
+- **Rent was priced from `M.stats.price`**, which only updates when the *host* calls `compute_stats`.
+  `run.lua` calls it once at the end, so rent would have been charged at the tick-0 price for an
+  entire run — the simulation's behaviour depending on the observer. Replaced with `REF`, a
+  volume-weighted price the tick maintains from trades it actually cleared. Same class of bug as the
+  rank sampling one; anything the model *reads* must be owned by the model.
+- **`max_holding` was a hidden policy knob.** At 8/16/32 cells the gini lands at 0.563/0.606/0.636 —
+  concentration does not self-limit, the top holders sit on whatever cap exists. Promoted to a knob
+  so the number is visible and ablatable rather than buried in a local.
+
+### A latent bug it exposed
+`phase_trade`'s post-trade belief update was the one belief path with no 0.05 floor on it. A seller
+whose ask fell below the floor could drag a buyer under it, and `validate()` caught it at tick 3325.
+It had never fired before because prices never went near the floor; rent draining tenant cash pushed
+the economy into the regime that reaches it. Assertions written for one model paying off in the next.
+
+### What it found
+- gini 0.348 -> 0.594, top 1% share 0.047 -> 0.113, on the same seeds.
+- Net lifetime `land` money by peak fifth: `-182 -611 -1102 -1181 +1048`. The bottom four fifths pay,
+  the top fifth collects.
+- Population falls a third, but through **fertility, not famine**: births -1742, starvations -1141 in
+  absolute terms. Rent drains the money a birth requires.
+- Re-measuring `credit` with land in the world **overturned the previous finding**: the richest fifth
+  goes from `credit +48` to `credit -179, land +1048`. Where land can be owned the top stops lending
+  for profit and collects rent, and ablating credit no longer dents the top 1%.
+- `estate_tax = 0.6` barely dents it (+0.230 against +0.246), because land passes to heirs untaxed.
+  Taxing money estates does not touch land inequality.
+- The `land` and `speculate` gene means both climb over a run: the model selects for enclosing.
+
 ## Status (2026-09-20) — measurement layer
 
 The sim could show that inequality happens but not say why anyone ended up where they did. Fixed by

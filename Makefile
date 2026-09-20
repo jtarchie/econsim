@@ -45,3 +45,4 @@ shots:
 	$(LUA) main.lua --no-selftest --seed=7 --speed=16 --shot=45 --shock-every=25 && mv shot.png docs/06-shock.png
 	$(LUA) main.lua --no-selftest --seed=7 --speed=32 --shot=94 --view=3 --mob  && mv shot.png docs/07-mobility.png
 	$(LUA) main.lua --no-selftest --seed=7 --speed=8  --shot=40 --view=1 --scenario=scenarios/credit.lua --arm=no-credit && mv shot.png docs/08-scenario.png
+	$(LUA) main.lua --no-selftest --seed=7 --speed=32 --shot=94 --view=4 --zoom=2 && mv shot.png docs/09-land.png

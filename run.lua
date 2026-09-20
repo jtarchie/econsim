@@ -24,7 +24,28 @@ local nseeds, seed0 = opt.seeds or 8, opt.seed0 or 1
 local arms = opt.arm and { scen.arm(sc, opt.arm) } or sc.arms
 
 -- the run-level numbers that end up in the table; everything else lives in the death records
-local METRICS = { "pop", "gini", "top1", "lines", "top_line", "price", "tool_price", "median_worth", "capital", "artisans", "nloans", "debt", "tot_births", "tot_starved", "tot_defaults", "tot_volume" }
+local METRICS = {
+  "pop",
+  "gini",
+  "top1",
+  "lines",
+  "top_line",
+  "price",
+  "tool_price",
+  "median_worth",
+  "capital",
+  "artisans",
+  "nloans",
+  "debt",
+  "owned",
+  "landlords",
+  "landless",
+  "biggest_holding",
+  "tot_births",
+  "tot_starved",
+  "tot_defaults",
+  "tot_volume",
+}
 
 local csv
 if opt.csv then

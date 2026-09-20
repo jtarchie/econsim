@@ -13,7 +13,7 @@ The world is sized at startup. The default is 2,000 units on 2048×2048; `--cap`
 to a continent — a quarter of a million units on 16384×16384 has been run to steady state with every
 invariant intact. See [Scale](#scale).
 
-LuaJIT + raylib, ~2,800 lines, no dependencies beyond the raylib shared library.
+LuaJIT + raylib, ~3,000 lines, no dependencies beyond the raylib shared library.
 
 ![mature economy](docs/03-mature.png)
 
@@ -40,14 +40,14 @@ who can make tools do not live where the food is.
 so it tiles seamlessly. The view draws every copy of the world the camera can see, so panning never
 runs out of map and a town sitting on the seam is drawn as one town rather than two halves.
 
-**Each dot is one person.** Its colour is a fixed projection of its 20-gene genome onto a hue, so
+**Each dot is one person.** Its colour is a fixed projection of its 21-gene genome onto a hue, so
 similar colours mean similar strategies and a spreading colour is a strategy winning. Its radius is
 net worth relative to the median (money + loans out − debt + goods and capital at market prices),
 deliberately exaggerated so a 10× fortune is impossible to miss. Squares are the *stubborn* class:
 frozen genome, frozen price beliefs, no drives. They are the control group, and the fact that they
 are still ~40% of the population at tick 3,000 is the point: adaptation buys less than you would think.
 
-**`C` cycles what the colour means.** The genome projection above is one of four views:
+**`C` cycles what the colour means.** The genome projection above is one of five views:
 
 | View | Colour |
 |---|---|
@@ -55,6 +55,7 @@ are still ~40% of the population at tick 3,000 is the point: adaptation buys les
 | `wealth rank` | blue is the poorest of the living, red the richest |
 | `dynasty` | one colour per founding line; a colour spreading is a lineage winning |
 | `income source` | the channel this unit has taken the most money from, so far, in its life |
+| `land` | tints each owned cell with its owner's colour, so you watch the map get enclosed |
 
 **Lines are loans**, drawn from lender to borrower, brightness in proportion to the amount owed.
 **Flashes** mark events: white = trade, green = birth, red = death, orange = default, blue = a loan
@@ -71,6 +72,7 @@ destroyed other than eating and spoilage.
 | `food / tools / capital` | median transaction prices, and mean installed capital per head |
 | `per 30t:` | births, starvations, old-age deaths and loan defaults in the last 30 ticks |
 | `lines` | founding lines with anyone left alive, and what the largest one owns |
+| `land` | share of cells owned, landlords against landless, rent flow, claims and foreclosures |
 | sparklines | population, Gini, food price and tool price over the last 240 samples |
 | wealth distribution | histogram of net worth in log₁₀ buckets — watch the right tail grow |
 | gene means | population-average of each gene (bar) and its history (line) |
@@ -116,10 +118,11 @@ are outstanding. The red disc top-centre is a crop failure in progress.
 
 ![mature](docs/03-mature.png)
 
-At tick ~3000 population, prices and Gini (0.333) have flattened out. The wealth histogram is a long
-right tail, births roughly balance deaths, and defaults have dropped to ~1 per 30 ticks because the
-reckless lenders are already dead. Note `artisans 3`: the tool sector has quietly died, which is the
-big open problem (see [`PLAN.md`](PLAN.md)).
+At tick ~3000 population and prices have flattened out, with Gini at 0.557 and the top 1% holding
+11%. 17.3% of the map is owned, by 902 landlords against 695 landless; 467 of the 2,000 founding
+lines still have a descendant alive. The wealth histogram is a long right tail and births roughly
+balance deaths. Note `artisans 1`: the tool sector has quietly died, which is the big open problem
+(see [`PLAN.md`](PLAN.md)).
 
 ### Inspector — one person's whole life
 
@@ -140,6 +143,18 @@ speculation, near-zero thrift and craft. It is a farmer-speculator that never to
 Zoomed into a single town. Big translucent circles are the rich, pinpricks are the poor, and the
 threads between them are outstanding loans. The colour mixing shows several genomes coexisting in
 the same market rather than one lineage sweeping.
+
+### Enclosure — the map being taken
+
+`luajit main.lua --seed=7 --speed=32 --shot=94 --view=4 --zoom=2`
+
+![land ownership](docs/09-land.png)
+
+The `land` view tints every owned cell with its owner's colour; grey-green land is still free. At
+tick 3,000, 17.3% of the map is owned by 902 landlords, and 695 units own nothing at all. Note the
+isolated claimed cells scattered out into empty country, well away from the town — those are
+speculators, who claim the best cell within reach rather than the one they stand on, so land gets
+enclosed before anyone arrives to work it.
 
 ### Crop failure — the shock channel
 
@@ -180,7 +195,12 @@ stands) and `say` (a caption on screen). The same file plays out in the window o
 luajit main.lua --scenario=scenarios/credit.lua --arm=no-credit   # watch one arm, with captions
 luajit run.lua  --scenario=scenarios/credit.lua --seeds=8         # run every arm, 8 seeds each
 make credit SEEDS=20                                              # same, one target per scenario
+make scenarios                                                    # all of them
 ```
+
+The ones in the box: `credit` (ablate lending, cap the interest rate), `enclosure` (can land be
+owned, and at what rent), `estate-tax` (tax estates into a flat dividend), `jubilee` (cancel all
+debt, once or repeatedly) and `famine` (a settled economy, then relentless crop failure).
 
 ![a scenario playing](docs/08-scenario.png)
 
@@ -206,23 +226,53 @@ rank born into, best rank reached, children, and all nine channels), for whateve
 
 ### What it says so far
 
-Three things fall out of the tables above, on the default world at 4,000 ticks, 8 seeds:
+On the default world, 4,000 ticks, 10 seeds per arm, paired on seed.
 
-- **Lending is how you win.** Net lifetime profit from credit, by the best fifth a unit ever reached:
-  `-7, -15, -36, -27, +35`. Only the top fifth makes money on credit; everyone else pays for it.
-  Abolish lending and Gini drops 0.048 ± 0.018 and the top 1% share falls by a quarter — with **no
-  measurable cost to output**. Median worth, installed capital and trade volume are all null.
-  Credit in this model moves money upward without financing anything.
-- **Capping the interest rate at 8% gets a third of that effect** and leaves more loans outstanding
-  (2,255 against 1,564) — cheap credit is credit more borrowers accept.
-- **The largest inflow to the rich is other people's deaths.** By quintile, money received from the
-  estates of dead neighbours runs `123, 328, 551, 799, 1478`, an order of magnitude above named
-  inheritance (`11 … 113`). Estates scatter to whoever is standing nearby, and the rich stand in
-  crowded towns. Inequality here is substantially a geography of who is near a funeral.
-- **Birth decides most of it.** 75% of those born into the poorest fifth never leave it; 31% of those
-  born into the richest fifth die there, against 4% of the poorest who ever reach it.
+**Owning land is how you win.** Turn enclosure on and Gini goes 0.348 → 0.594 (+0.246 ± 0.015) and
+the top 1% share more than doubles, 0.047 → 0.113 (+0.067 ± 0.011). Net lifetime money from land, by
+the best fifth a unit ever reached:
 
-Each of those is a claim the code will now argue with you about, which is the point.
+```
+peak fifth     poorest    lower   middle    upper  richest
+land              -182     -611    -1102    -1181    +1048
+```
+
+The bottom four fifths pay rent; only the top fifth collects it. For the middle fifth, land is a
+lifetime drain of 1,102 against total sales income of 856 — rent costs them more than they earn by
+selling.
+
+**It shrinks the population by a third, through fertility rather than famine.** Births fall 1,742 ±
+236 while starvations fall 1,141 ± 194 *in absolute terms*. Nobody is being starved out by rent;
+they are being kept too poor to afford a child's stake. Trade volume halves, so the economy produces
+and exchanges much less. Defaults rise 71% and total debt by two thirds — rent pushes tenants into
+credit they cannot service.
+
+**A 60% estate tax does almost nothing to it** (Gini +0.230 against +0.246). Land passes to the heir
+whole, unsplit and untaxed, so taxing money estates leaves the thing that actually compounds
+untouched. Cutting the rent rate to 5% *does* work (+0.041 ± 0.016), which is the dose-response you
+would want before believing any of this.
+
+**Land changed what credit is for.** Measured again with land in the world, abolishing lending still
+cuts Gini (−0.064 ± 0.020) but **no longer measurably dents the top 1%** (−0.006 ± 0.010, the
+interval straddles zero). The channel tables say why — for the richest fifth:
+
+| | commons | enclosed |
+|---|---|---|
+| `credit` | +48 | **−179** |
+| `land` | 0 | **+1048** |
+
+Where land cannot be owned, the top fifth makes a small profit lending. Where it can, the top fifth
+*loses* money on credit and collects rent instead. The earlier finding here — "lending is how you
+win" — was true only of a world with no landlords in it, which is a good argument for re-running
+every claim after every model change.
+
+**Birth decides most of it, more so once land exists.** 71% of those born into the poorest fifth
+never leave it, and only 7% ever reach the top (against 5% before enclosure); 22% of those born
+richest die there. Estates of dead neighbours remain the second-largest inflow to the rich (`105 …
+1545` by quintile) and still dwarf named inheritance (`5 … 145`), because estates scatter to whoever
+is standing nearby and the rich stand in crowded towns.
+
+Each of those is a claim the code will argue with you about, which is the point.
 
 ## Controls
 
@@ -230,7 +280,7 @@ Each of those is a claim the code will now argue with you about, which is the po
 | --- | --- |
 | `space` | pause |
 | `-` / `=` | halve / double ticks per frame |
-| `C` | cycle the colour view (genome / wealth rank / dynasty / income source) |
+| `C` | cycle the colour view (genome / wealth rank / dynasty / income source / land) |
 | `M` | mobility table |
 | `S` | crop failure at the mouse |
 | `J` | jubilee: forgive every outstanding debt |
@@ -250,8 +300,20 @@ Both binaries take the same world knobs; `--help` prints them with defaults.
 --cap --grid --cell --compact-every                      world size and memory layout
 --pop --money --artisans --yield --toolrate --mut        economy
 --estate-tax --lending --usury --shock-every             policy
+--enclosure --rent --land-price --max-holding            land
 --stubborn-founders --stubborn-birth --track
 ```
+
+`--enclosure=0` is a world where land cannot be owned at all; above zero it scales how readily
+unowned cells are claimed. `--rent` is the share of a cell's yield its owner collects from whoever
+works it, `--land-price` the cash a claim costs, and `--max-holding` the ceiling on cells per unit.
+That last one is not a neutral implementation detail: **the top holders sit on whatever cap you set**,
+and Gini lands at 0.563 / 0.606 / 0.636 for caps of 8 / 16 / 32. Nothing in the model stops one unit
+owning the world except that number, so it is a knob rather than a constant.
+
+Ownership costs one `int32` per cell plus `2 × max_holding × 4` bytes per unit slot (1MB on the
+default world, 33MB at continental cap) and is within noise of free on the tick. `--enclosure=0`
+allocates none of it.
 
 `--lending` scales how often surplus money is offered as a loan (`0` is an economy with no credit)
 and `--usury` caps the interest rate; both are the levers the `credit` scenario pulls. `--track=0`
@@ -279,17 +341,22 @@ Unknown flags, non-numbers and out-of-range values exit 2.
    gathers that follow walk memory forwards instead of jumping around an array far larger than cache.
    Slot identity carries no economic state, so this changes nothing but the addresses.
 2. **Produce** — food and tools from the local field × labour × capital, divided by crowding.
-   Splitting effort between the two is penalised (squared shares), so specialising pays.
+   Splitting effort between the two is penalised (squared shares), so specialising pays. If someone
+   else owns the cell, a `rent` share of what it yields goes to them at the going market price.
 3. **Scan** — each unit looks at its cell neighbourhood once: who is selling, who is rich, who is kin.
 4. **Trade** — two markets, food and tools. Buyers pay up to their belief-driven willingness to pay,
    sellers ask their reference price plus greed. Both sides update their beliefs from what happened.
 5. **Lend** — surplus money becomes a fixed-term loan; the borrower converts it to capital, which
-   multiplies labour and depreciates 0.3% per tick. Death or strategic default leaves the lender short.
-6. **Move** — hunger climbs the food-supply field, cargo climbs the demand field, and ambition climbs
+   multiplies labour and depreciates 0.3% per tick. Death or strategic default leaves the lender short,
+   and takes one of the borrower's cells in lieu.
+6. **Claim** — a unit with cash to spare buys an unowned cell from the commons. Speculators claim the
+   best cell within reach rather than the one under their feet, so land is enclosed ahead of settlement.
+7. **Move** — hunger climbs the food-supply field, cargo climbs the demand field, and ambition climbs
    the yield-per-head field. Movement is paid for by distance actually travelled.
-7. **Birth** — enough money, enough food banked and not too crowded: a child is placed by a greedy
+8. **Birth** — enough money, enough food banked and not too crowded: a child is placed by a greedy
    climb of the opportunity field, with a mutated genome and a stake out of the parent's pocket.
-8. **Settle** — loan instalments, deaths, estates (creditors, then heirs, then neighbours), dividend.
+9. **Settle** — loan instalments, deaths, estates (creditors, then heirs, then neighbours), dividend.
+   Land passes whole to the heir, unsplit and untaxed.
 
 **Money is closed and exact.** It is stored as integer-valued doubles and every transfer is floored,
 so `sum(money) + sum(escrow)` is the same number on tick 1 and tick 100,000. Only food and tools are
@@ -371,6 +438,7 @@ Each gene has a cost, or it would simply evolve to 1.0 and the simulation would 
 | `build` | converts money into capital |
 | `speculate` | buys to resell rather than to consume |
 | `peddle` | carries cargo toward demand |
+| `land` | appetite for claiming cells — the cash spent is not producing anything |
 | `speed` / `seek_rich` / `seek_kin` / `migrate` | movement drives |
 | `repro_thresh` / `endowment` / `inherit` | when to breed, the child's stake, how the estate splits |
 

@@ -25,8 +25,9 @@ local CHAN_RGB = {
   { 255, 215, 90 },
   { 120, 230, 220 },
   { 230, 230, 230 },
+  { 200, 160, 110 },
 }
-local VIEWS = { "genome", "wealth rank", "dynasty", "income source" }
+local VIEWS = { "genome", "wealth rank", "dynasty", "income source", "land" }
 
 -- fail before the window opens: every raylib symbol must resolve, struct layouts must match the C ABI, and the sim must pass its audit
 local RAYLIB_SYMBOLS = [[
@@ -48,7 +49,7 @@ local opt = sim.parse_args(arg, {
   height = "window height (default 800)",
   zoom = "starting zoom, 1 = whole world fits (default 1)",
   pick = "select the richest unit (for screenshots)",
-  view = "start in this colour view: 0 genome, 1 wealth rank, 2 dynasty, 3 income source",
+  view = "start in this colour view: 0 genome, 1 wealth rank, 2 dynasty, 3 income source, 4 land",
   mob = "open the mobility panel at startup",
   scenario = { "path to a scenario file to play out" },
   arm = { "which arm of the scenario to run" },
@@ -70,11 +71,19 @@ assert(dot.id > 0, "dot texture failed to upload")
 rl.SetTextureFilter(dot, 1)
 
 local land_px, land
-local function paint_land()
+-- owned cells are tinted with their owner's colour, so enclosure is something you watch spread across the map
+local function paint_land(owners)
   land_px = land_px or ffi.new("uint8_t[?]", sim.GRID * sim.GRID * 4)
+  local own = owners and sim.own
   for c = 0, sim.GRID * sim.GRID - 1 do
     local f, o = sim.fert[c], sim.ore[c]
-    land_px[c * 4], land_px[c * 4 + 1], land_px[c * 4 + 2], land_px[c * 4 + 3] = 18 + f * 20 + o * 75, 22 + f * 70 + o * 30, 18 + f * 20, 255
+    local r, g, b = 18 + f * 20 + o * 75, 22 + f * 70 + o * 30, 18 + f * 20
+    local w = own and own[c] or -1
+    if w >= 0 then
+      local u = U[w]
+      r, g, b = r * 0.5 + u.cr * 0.36, g * 0.5 + u.cg * 0.36, b * 0.5 + u.cb * 0.36
+    end
+    land_px[c * 4], land_px[c * 4 + 1], land_px[c * 4 + 2], land_px[c * 4 + 3] = r, g, b, 255
   end
   if land then
     rl.UpdateTexture(land, land_px)
@@ -124,7 +133,7 @@ local function radius(u) return max(1, min(60, 2.5 * sim.worth(u) / sim.stats.me
 -- the channel a unit has taken most money from; what it lives on, rather than what its genes say it should
 local function income_of(bio)
   local best, bv = 1, 0
-  for c = 0, 8 do
+  for c = 0, #sim.CHANNELS - 1 do
     local v = bio.chan[c]
     if v > bv then
       best, bv = c + 1, v
@@ -300,6 +309,11 @@ local function draw_ui()
   line(("per 30t: births %d  starved %d  aged %d  defaults %d"):format(s.births, s.starved, s.aged, s.defaults))
   line(("         trades %d (spec %d)  volume %.0f (tools %.0f)"):format(s.trades, s.spec, s.volume, s.tool_volume))
   line(("lines %d of %d founders   biggest owns %.1f%% of people, %.1f%% of wealth"):format(s.lines, k.pop, s.top_line * 100, s.top_line_worth * 100))
+  if k.enclosure > 0 then
+    line(("land %.1f%% owned   %d landlords, %d landless   rent %.0f/30t   %d claims, %d foreclosed"):format(s.owned * 100, s.landlords, s.landless, s.rent, s.claims, s.foreclosed))
+  else
+    line("land is a commons: nobody can own a cell (--enclosure=0)", DIM)
+  end
   line(("view: %s   C to cycle   M mobility"):format(VIEWS[view + 1]), color(120, 220, 255))
   y = y + 4
   for i, name in ipairs({ "population", "gini", "food price", "tool price" }) do
@@ -343,6 +357,8 @@ local function draw_ui()
     line("blue = poorest, red = richest, by rank among the living", DIM)
   elseif view == 2 then
     line("one colour per founding line; a spreading colour is a dynasty winning", DIM)
+  elseif view == 4 then
+    line("each owned cell is tinted with its owner's colour; grey land is still free", DIM)
   end
 
   local sel = sim.selected
@@ -359,6 +375,7 @@ local function draw_ui()
       ("lent %.0f   debt %.0f"):format(u.lent, u.debt),
       ("food %.1f   tools %.1f   capital %.1f%s"):format(u.stock[0], u.stock[1], u.capital, u.stubborn == 1 and "   STUBBORN" or ""),
       ("belief food %.2f  tools %.2f   loans out %d"):format(u.belief[0], u.belief[1], u.nloans),
+      ("holds %d cells%s"):format(u.ncells, sim.own and sim.own[u.cell] >= 0 and (sim.own[u.cell] == sel and "   works its own land" or ("   pays rent to %d"):format(sim.own[u.cell])) or "   works free land"),
     }
     for i, str in ipairs(rows) do
       rl.DrawText(str, x0 + 10, 8 + i * 14, 10, WHITE)
@@ -468,7 +485,10 @@ while not rl.WindowShouldClose() do
   if rl.IsKeyPressed(KEY.LB) then k.mut = max(0.001, k.mut / 1.25) end
   if rl.IsKeyPressed(KEY.T) then k.estate_tax = min(1, k.estate_tax + 0.1) end
   if rl.IsKeyPressed(KEY.G) then k.estate_tax = max(0, k.estate_tax - 0.1) end
-  if rl.IsKeyPressed(KEY.C) then view = (view + 1) % #VIEWS end
+  if rl.IsKeyPressed(KEY.C) then
+    view = (view + 1) % #VIEWS
+    paint_land(view == 4)
+  end
   if rl.IsKeyPressed(KEY.M) then show_mob = not show_mob end
   if rl.IsKeyPressed(KEY.J) then sim.jubilee() end
   local mx, my = rl.GetMouseX(), rl.GetMouseY()
@@ -508,6 +528,8 @@ while not rl.WindowShouldClose() do
     if ticks_since_stats >= 30 then
       ticks_since_stats = 0
       sim.compute_stats()
+      -- ownership changes slowly and repainting is a full texture upload, so it rides the stats cadence
+      if view == 4 then paint_land(true) end
     end
   end
   local sel = sim.selected

@@ -7,7 +7,9 @@ local floor, ceil, sqrt, atan2, abs = math.floor, math.ceil, math.sqrt, math.ata
 local NAN = 0 / 0
 local random, min, max, log = math.random, math.min, math.max, math.log
 
-local NG, TERM, NFLASH, HN = 20, 600, 4096, 240
+local NG, TERM, NFLASH, HN = 21, 600, 4096, 240
+-- set from the max_holding knob at init; nothing in the model stops one unit owning everything, so this cap is what does, and it binds
+local MAXCELLS = 8
 -- world size is picked at init() from the cap/grid/cell knobs; everything below is derived from it
 local CAP, GRID, CELL = 0, 0, 0
 local MASK, GMASK, NC, W, R2, MAXLOANS, MAXPAIRS = 0, 0, 0, 0, 0, 0, 0
@@ -16,12 +18,12 @@ local INV_W, INV_CELL, INV_GRID = 0, 0, 0
 
 local PROD, RESERVE, GREED, HERD, THRIFT, INVEST, RISK, TRUST, SPEED = 0, 1, 2, 3, 4, 5, 6, 7, 8
 local SEEK_RICH, SEEK_KIN, MIGRATE, REPRO, ENDOW, INHERIT, BORROW, BUILD = 9, 10, 11, 12, 13, 14, 15, 16
-local SPECULATE, PEDDLE, CRAFT = 17, 18, 19
+local SPECULATE, PEDDLE, CRAFT, LAND = 17, 18, 19, 20
 local FOOD, TOOLS = 0, 1
 
 -- signed and exhaustive, so a unit's channels sum to exactly its money: that is what makes "where did this fortune come from" answerable, and validate() checks it
-local NCHAN = 9
-local CH_FOUND, CH_SELL, CH_BUY, CH_CREDIT, CH_DEBT, CH_STAKE, CH_BEQUEST, CH_SCATTER, CH_DIVIDEND = 0, 1, 2, 3, 4, 5, 6, 7, 8
+local NCHAN = 10
+local CH = { FOUND = 0, SELL = 1, BUY = 2, CREDIT = 3, DEBT = 4, STAKE = 5, BEQUEST = 6, SCATTER = 7, DIVIDEND = 8, LAND = 9 }
 
 ffi.cdef([[
 typedef struct {
@@ -30,12 +32,12 @@ typedef struct {
   float stock[2], belief[2], ask[2], surplus[2], capital, hue;
   uint32_t age, gen, heir_gen, dyn;
   int32_t default_tick, cell, heir;
-  uint8_t nloans, alive, sold[2], cr, cg, cb, stubborn;
-  float g[20];
+  uint8_t nloans, alive, sold[2], cr, cg, cb, stubborn, ncells;
+  float g[21];
 } unit_t;
 /* cold biography, --track only: kept out of unit_t so the memory-bound tick never drags it through cache */
 typedef struct {
-  double chan[9];
+  double chan[10];
   float peak, cur, ppct;
   int32_t born, kids;
 } trk_t;
@@ -77,9 +79,10 @@ local M = {
     "speculate",
     "peddle",
     "craft",
+    "land",
   },
   FLASH = { TRADE = 0, BIRTH = 1, DEATH = 2, DEFAULT = 3, LOAN = 4 },
-  CHANNELS = { "founding", "sales", "purchases", "credit", "debt", "children", "bequest", "estates", "dividend" },
+  CHANNELS = { "founding", "sales", "purchases", "credit", "debt", "children", "bequest", "estates", "dividend", "land" },
   CAUSES = { "starved", "aged" },
   knobs = {
     cap = 16384,
@@ -99,6 +102,10 @@ local M = {
     track = 1,
     lending = 1.0,
     usury = 1.0,
+    enclosure = 1.0,
+    rent = 0.2,
+    land_price = 150,
+    max_holding = 8,
   },
   KNOB_HELP = {
     cap = "unit slots, a power of two; the hard population ceiling",
@@ -118,6 +125,10 @@ local M = {
     track = "1 to record per-unit money channels, rank history and death records; 0 costs nothing",
     lending = "scales how often surplus money is offered as a loan; 0 is an economy with no credit",
     usury = "hard ceiling on the interest rate a lender may charge",
+    enclosure = "scales how readily unowned land is claimed; 0 is a world where nobody can own land",
+    rent = "share of what a cell yields that its owner collects from whoever works it",
+    land_price = "money paid to the commons to claim one unowned cell",
+    max_holding = "most cells one unit may hold; the top holders sit on this cap, so it bounds concentration",
   },
   shock = { x = 0, y = 0, r = 0, ttl = 0 },
   -- the unit the UI is following; compaction moves slots, so the sim owns this index
@@ -145,6 +156,11 @@ local TOT = { births = 0, starved = 0, aged = 0, defaults = 0, trades = 0, volum
 -- biography arrays and the dynasty histogram; TR is nil unless --track is on, so every use is guarded by trk
 local TR, T2, TR_CAP, trk = nil, nil, 0, false
 local dcount, dworth, ndyn = nil, nil, 0
+-- own[cell] is the slot that owns it or -1; cells[] is the same fact per unit, so a death can find its own land without sweeping the map
+local own, cells, cells2, enc = nil, nil, nil, false
+local LND = { rent = 0, claims = 0, foreclosed = 0 }
+-- the price rent is charged at must be the sim's own, not whatever compute_stats last left lying around, or a host that rarely asks for stats would charge rent at a year-old price
+local REF = ffi.new("double[6]")
 -- the cause a unit is dying of, parallel to dying[]: known at kill(), needed at bury(), and never after
 local dying_why = nil
 
@@ -157,6 +173,30 @@ end
 local function led(i, k, v)
   local c = TR[i].chan
   c[k] = c[k] + v
+end
+
+-- swap-remove from the owner's list; the two sides of ownership must never disagree, and validate() says so
+local function land_drop(c)
+  local o = own[c]
+  if o < 0 then return end
+  local u = U[o]
+  local base, n = o * MAXCELLS, U[o].ncells
+  for k = 0, n - 1 do
+    if cells[base + k] == c then
+      cells[base + k] = cells[base + n - 1]
+      u.ncells = n - 1
+      break
+    end
+  end
+  own[c] = -1
+end
+
+local function land_give(c, i)
+  local u = U[i]
+  if u.ncells >= MAXCELLS then return false end
+  cells[i * MAXCELLS + u.ncells] = c
+  u.ncells, own[c] = u.ncells + 1, i
+  return true
 end
 
 local function paint(u)
@@ -233,6 +273,8 @@ function M.init(seed)
   reset_scratch()
   flash_head, M.shock.x, M.shock.y, M.shock.r = 0, 0, 0, 0
   c_births, c_starved, c_aged, c_defaults, c_trades, c_volume, c_loans, c_spec, c_tool_vol = 0, 0, 0, 0, 0, 0, 0, 0, 0
+  LND.rent, LND.claims, LND.foreclosed = 0, 0, 0
+  REF[0], REF[1], REF[2], REF[3], REF[4], REF[5] = 10, 20, 0, 0, 0, 0
   TOT.births, TOT.starved, TOT.aged, TOT.defaults, TOT.trades, TOT.volume = 0, 0, 0, 0, 0, 0
   if trk then ffi.fill(TR, CAP * ffi.sizeof("trk_t")) end
   M.reset_deaths()
@@ -342,11 +384,21 @@ local function compact()
     remap[i], nn2[s] = s, SC[i].nn
     ffi.copy(U2 + s, U + i, UNIT_BYTES)
     if trk then ffi.copy(T2 + s, TR + i, TRK_BYTES) end
+    if enc then ffi.copy(cells2 + s * MAXCELLS, cells + i * MAXCELLS, MAXCELLS * 4) end
   end
   ffi.copy(U, U2, nlive * UNIT_BYTES)
   if trk then
     ffi.copy(TR, T2, nlive * TRK_BYTES)
     ffi.fill(TR + nlive, (CAP - nlive) * TRK_BYTES)
+  end
+  if enc then
+    ffi.copy(cells, cells2, nlive * MAXCELLS * 4)
+    ffi.fill(cells + nlive * MAXCELLS, (CAP - nlive) * MAXCELLS * 4, 0xFF)
+    -- own[] names slots, and every slot just moved; a dead owner would remap to -1, which reads as unowned
+    for c = 0, NC - 1 do
+      local o = own[c]
+      if o >= 0 then own[c] = remap[o] end
+    end
   end
   -- dead slots must read as never-used: validate() insists they hold no money
   ffi.fill(U + nlive, (CAP - nlive) * UNIT_BYTES)
@@ -458,7 +510,17 @@ ensure_track = function()
     ndyn = M.knobs.pop
     dcount, dworth = ffi.new("int32_t[?]", ndyn + 1), ffi.new("double[?]", ndyn + 1)
   end
-  M.track = TR
+  enc, MAXCELLS = M.knobs.enclosure > 0, M.knobs.max_holding
+  if enc and (cells == nil or ffi.sizeof(cells) ~= CAP * MAXCELLS * 4) then
+    own = ffi.new("int32_t[?]", NC)
+    cells, cells2 = ffi.new("int32_t[?]", CAP * MAXCELLS), ffi.new("int32_t[?]", CAP * MAXCELLS)
+  end
+  if enc then
+    ffi.fill(own, NC * 4, 0xFF)
+    ffi.fill(cells, CAP * MAXCELLS * 4, 0xFF)
+  end
+  -- an --enclosure=0 run must not hand out the ownership map a previous init left allocated
+  M.track, M.own = TR, enc and own or nil
 end
 
 -- scratch carries last tick's scan into produce(); stale values from a previous run made reseeded runs diverge
@@ -477,6 +539,9 @@ local function phase_produce(pop)
   local sh = M.shock
   local sx, sy, sr2 = sh.x, sh.y, sh.ttl > 0 and sh.r * sh.r or -1
   local YIELD, TOOLRATE = M.knobs.yield, M.knobs.toolrate
+  -- rent is charged on what the land yields, valued at the going price, so a landlord's take tracks the market rather than a constant
+  local RENT = enc and M.knobs.rent or 0
+  local pf, pt = REF[0], REF[1]
   for s = 0, pop - 1 do
     local i = cell_items[s]
     local u = U[i]
@@ -492,11 +557,28 @@ local function phase_produce(pop)
     local labor = g[PROD] * (1 + 0.15 * sqrt(u.capital))
     -- squared labour shares: splitting effort is wasteful, so specialising + trading beats self-sufficiency
     local farm, craft = (1 - g[CRAFT]) * (1 - g[CRAFT]), g[CRAFT] * g[CRAFT]
-    local net = YIELD * labor * farm * f / (0.5 + 0.5 * crowd) - upkeep
+    local density = 0.5 + 0.5 * crowd
+    local grain, forge = YIELD * labor * farm * f / density, TOOLRATE * labor * craft * ore[cell] / density
+    local net = grain - upkeep
     sc_net[i] = net
     u.stock[FOOD] = (u.stock[FOOD] + net) * 0.998
-    u.stock[TOOLS] = u.stock[TOOLS] + TOOLRATE * labor * craft * ore[cell] / (0.5 + 0.5 * crowd)
+    u.stock[TOOLS] = u.stock[TOOLS] + forge
     u.capital = u.capital * 0.997
+    if RENT > 0 then
+      local o = own[cell]
+      -- what the tenant cannot pay is simply not paid: arrears would need a whole second credit system
+      if o >= 0 and o ~= i then
+        local due = min(u.money, floor(RENT * (grain * pf + forge * pt)))
+        if due > 0 then
+          u.money, U[o].money = u.money - due, U[o].money + due
+          LND.rent = LND.rent + due
+          if trk then
+            led(i, CH.LAND, -due)
+            led(o, CH.LAND, due)
+          end
+        end
+      end
+    end
     if u.stock[FOOD] < 0 then
       c_starved, TOT.starved = c_starved + 1, TOT.starved + 1
       kill(i, u, 1)
@@ -743,14 +825,16 @@ local function phase_trade(pop, start, stride, k)
         s.stock[k], s.surplus[k], s.money, s.sold[k] = s.stock[k] - qty, s.surplus[k] - qty, s.money + cost, 1
         u.stock[k], u.surplus[k], u.money = u.stock[k] + qty, u.surplus[k] + qty, u.money - cost
         if trk then
-          led(best, CH_SELL, cost)
-          led(i, CH_BUY, -cost)
+          led(best, CH.SELL, cost)
+          led(i, CH.BUY, -cost)
         end
         c_trades, c_volume = c_trades + 1, c_volume + cost
+        REF[2 + k], REF[4 + k] = REF[2 + k] + qty, REF[4 + k] + cost
         TOT.trades, TOT.volume = TOT.trades + 1, TOT.volume + cost
         c_tool_vol = c_tool_vol + cost * k
         if want then
-          u.belief[k] = u.belief[k] + (ask - u.belief[k]) * 0.3 * (1 - u.stubborn)
+          -- floored like every other belief update: a seller asking below the floor could otherwise drag a buyer under it
+          u.belief[k] = max(0.05, u.belief[k] + (ask - u.belief[k]) * 0.3 * (1 - u.stubborn))
         else
           -- speculative buys leave belief alone: arbitrage needs a price memory from elsewhere
           c_spec = c_spec + 1
@@ -795,11 +879,39 @@ local function phase_lend(pop, start, stride)
         u.money, u.lent, u.nloans = u.money - amount, u.lent + owed, u.nloans + 1
         o.money, o.debt = o.money + amount, o.debt + owed
         if trk then
-          led(i, CH_CREDIT, -amount)
-          led(cand, CH_DEBT, amount)
+          led(i, CH.CREDIT, -amount)
+          led(cand, CH.DEBT, amount)
         end
         c_loans = c_loans + 1
         flash(o.x, o.y, 4)
+      end
+    end
+  end
+end
+
+-- gated on money, so enclosure is a rich unit's move: the barrier to entry is the mechanism, not a side effect
+local function phase_claim(pop)
+  local rate, price = 0.02 * M.knobs.enclosure, M.knobs.land_price
+  for s = 0, pop - 1 do
+    local i = cell_items[s]
+    local u = U[i]
+    if u.alive == 1 and u.ncells < MAXCELLS and u.money >= price and random() < u.g[LAND] * rate then
+      local best, bv = -1, -1
+      if u.g[SPECULATE] > 0.5 then
+        local cx, cy = band(u.cell, GMASK), floor(u.cell * INV_GRID)
+        for n = 0, 8 do
+          local c = band(cy + off_y[n], GMASK) * GRID + band(cx + off_x[n], GMASK)
+          if own[c] < 0 and res[c] + res[NC + c] > bv then
+            best, bv = c, res[c] + res[NC + c]
+          end
+        end
+      elseif own[u.cell] < 0 then
+        best = u.cell
+      end
+      if best >= 0 and land_give(best, i) then
+        u.money, commons = u.money - price, commons + price
+        LND.claims = LND.claims + 1
+        if trk then led(i, CH.LAND, -price) end
       end
     end
   end
@@ -866,8 +978,8 @@ local function phase_birth(pop)
       c.money, c.capital, c.cell, c.dyn = floor(u.money * frac), u.capital * frac, at, u.dyn
       u.money, u.capital = u.money - c.money, u.capital - c.capital
       if trk then
-        led(ci, CH_FOUND, c.money)
-        led(i, CH_STAKE, -c.money)
+        led(ci, CH.FOUND, c.money)
+        led(i, CH.STAKE, -c.money)
         -- the rank the child is born into, kept for the mobility table it will land in when it dies
         TR[ci].ppct, TR[i].kids = TR[i].cur, TR[i].kids + 1
       end
@@ -917,13 +1029,20 @@ local function step_loans()
         b.money, le.money = b.money - pay, le.money + pay
         b.debt, le.lent, l.owed = b.debt - pay, le.lent - pay, l.owed - pay
         if trk and pay ~= 0 then
-          led(l.borrower, CH_DEBT, -pay)
-          led(l.lender, CH_CREDIT, pay)
+          led(l.borrower, CH.DEBT, -pay)
+          led(l.lender, CH.CREDIT, pay)
         end
         if l.owed <= 0 then
           close_loan(li, l, le)
         elseif b.alive == 2 or tick > l.expiry then
           b.debt, b.default_tick = b.debt - l.owed, tick
+          -- the lender takes land rather than nothing, which is how default concentrates ownership instead of just destroying credit
+          if enc and b.ncells > 0 and le.ncells < MAXCELLS and le.alive == 1 then
+            local c = cells[l.borrower * MAXCELLS + b.ncells - 1]
+            land_drop(c)
+            land_give(c, l.lender)
+            LND.foreclosed = LND.foreclosed + 1
+          end
           c_defaults, TOT.defaults = c_defaults + 1, TOT.defaults + 1
           flash(le.x, le.y, 3)
           close_loan(li, l, le)
@@ -994,10 +1113,19 @@ local function bury()
     local tax = floor(estate * M.knobs.estate_tax)
     commons, estate = commons + tax, estate - tax
     local h = u.heir
-    if h >= 0 and U[h].alive == 1 and U[h].gen == u.heir_gen then
+    local has_heir = h >= 0 and U[h].alive == 1 and U[h].gen == u.heir_gen
+    if has_heir then
       local part = floor(estate * u.g[INHERIT])
       U[h].money, estate = U[h].money + part, estate - part
-      if trk then led(h, CH_BEQUEST, part) end
+      if trk then led(h, CH.BEQUEST, part) end
+    end
+    -- land passes whole to the heir and is not split or taxed, so holdings compound down a line where money does not
+    if enc then
+      while u.ncells > 0 do
+        local c = cells[i * MAXCELLS + u.ncells - 1]
+        land_drop(c)
+        if has_heir then land_give(c, h) end
+      end
     end
     local cx, cy, nn = band(u.cell, GMASK), floor(u.cell / GRID), 0
     for n = 0, 8 do
@@ -1013,7 +1141,7 @@ local function bury()
     end
     if trk and share ~= 0 then
       for t = 0, nn - 1 do
-        led(heirs[t], CH_SCATTER, share)
+        led(heirs[t], CH.SCATTER, share)
       end
     end
     estate = estate - share * nn
@@ -1059,6 +1187,9 @@ function M.tick()
     before = dbg and M.totals()
     phase_lend(pop, random(0, pop - 1), PRIMES[random(#PRIMES)])
     if dbg then M.check_conserved("lend", before, M.totals(), true) end
+    before = dbg and M.totals()
+    if enc then phase_claim(pop) end
+    if dbg then M.check_conserved("claim", before, M.totals(), true) end
     phase_move(pop)
     before = dbg and M.totals()
     phase_birth(pop)
@@ -1080,11 +1211,16 @@ function M.tick()
       end
       if trk then
         for s = 0, nlive - 1 do
-          led(live[s], CH_DIVIDEND, per)
+          led(live[s], CH.DIVIDEND, per)
         end
       end
       commons = commons - per * alive
     end
+  end
+  -- eased rather than replaced: a thin tick's few trades must not swing what every tenant is charged
+  for k = 0, 1 do
+    if REF[2 + k] > 0 then REF[k] = REF[k] * 0.9 + REF[4 + k] / REF[2 + k] * 0.1 end
+    REF[2 + k], REF[4 + k] = 0, 0
   end
   if trk and (tick % 30 == 0 or tick == 1) then update_ranks() end
 end
@@ -1308,6 +1444,19 @@ function M.compute_stats()
   end
   s.lines, s.top_line, s.top_line_worth = lines, n > 0 and big / n or 0, allw > 0 and bigw / allw or 0
 
+  -- landless is the number that matters: owning nothing is the condition enclosure creates
+  local held, lords, biggest = 0, 0, 0
+  if enc then
+    for k = 0, nlive - 1 do
+      local u = U[live[k]]
+      if u.alive == 1 and u.ncells > 0 then
+        held, lords = held + u.ncells, lords + 1
+        if u.ncells > biggest then biggest = u.ncells end
+      end
+    end
+  end
+  s.owned, s.landlords, s.landless, s.biggest_holding = held / NC, lords, n - lords, biggest
+
   local means = s.means or {}
   for k = 1, NG do
     means[k] = n > 0 and gsum[k - 1] / n or 0
@@ -1318,7 +1467,10 @@ function M.compute_stats()
   -- the per-30-tick counters above are zeroed here, so anything comparing whole runs needs these
   s.tot_births, s.tot_starved, s.tot_aged, s.tot_defaults, s.tot_trades, s.tot_volume = TOT.births, TOT.starved, TOT.aged, TOT.defaults, TOT.trades, TOT.volume
   s.trades, s.volume, s.new_loans, s.spec, s.tool_volume = c_trades, c_volume, c_loans, c_spec, c_tool_vol
+  s.rent, s.claims, s.foreclosed = LND.rent, LND.claims, LND.foreclosed
+  s.ref_price, s.ref_tool = REF[0], REF[1]
   c_spec, c_tool_vol = 0, 0
+  LND.rent, LND.claims, LND.foreclosed = 0, 0, 0
   s.unmet = s.unmet or {}
   for k = 0, 7 do
     s.unmet[k], unmet[k] = unmet[k], 0
@@ -1361,7 +1513,7 @@ check_static = function()
   check(R2 <= CELL * CELL, "interaction radius %g exceeds cell size %d: the 3x3 scan would miss neighbours", sqrt(R2), CELL)
   check(#M.GENES == NG, "GENES has %d names for %d genes", #M.GENES, NG)
   check(ffi.sizeof("unit_t") > 0 and ffi.sizeof(U[0].g) == NG * 4, "unit_t.g holds %d floats, NG is %d", ffi.sizeof(U[0].g) / 4, NG)
-  local idx = { PROD, RESERVE, GREED, HERD, THRIFT, INVEST, RISK, TRUST, SPEED, SEEK_RICH, SEEK_KIN, MIGRATE, REPRO, ENDOW, INHERIT, BORROW, BUILD, SPECULATE, PEDDLE, CRAFT }
+  local idx = { PROD, RESERVE, GREED, HERD, THRIFT, INVEST, RISK, TRUST, SPEED, SEEK_RICH, SEEK_KIN, MIGRATE, REPRO, ENDOW, INHERIT, BORROW, BUILD, SPECULATE, PEDDLE, CRAFT, LAND }
   check(#idx == NG, "%d gene index constants for %d genes", #idx, NG)
   local seen = {}
   for _, k in ipairs(idx) do
@@ -1400,6 +1552,10 @@ function M.check_knobs()
   check(k.track == 0 or k.track == 1, "knob track=%g must be 0 or 1", k.track)
   check(k.lending >= 0 and k.lending <= 1, "knob lending=%g outside [0,1]", k.lending)
   check(k.usury > 0, "knob usury=%g must be positive", k.usury)
+  check(k.enclosure >= 0 and k.enclosure <= 1, "knob enclosure=%g outside [0,1]", k.enclosure)
+  check(k.rent >= 0 and k.rent < 1, "knob rent=%g outside [0,1)", k.rent)
+  check(whole(k.land_price) and k.land_price >= 1, "knob land_price=%g must be a positive integer", k.land_price)
+  check(whole(k.max_holding) and k.max_holding >= 1 and k.max_holding <= 64, "knob max_holding=%g must be a whole number in 1..64", k.max_holding)
 end
 
 function M.totals()
@@ -1585,6 +1741,39 @@ function M.validate()
     check(U[i].nloans == nl[i], "unit %d nloans %d ~= %d loans it holds", i, U[i].nloans, nl[i])
   end
 
+  -- the two sides of ownership are stored separately for speed, so prove they still agree
+  if enc then
+    local held = 0
+    for c = 0, NC - 1 do
+      local o = own[c]
+      check(o >= -1 and o < CAP, "cell %d owned by slot %d", c, o)
+      if o >= 0 then
+        held = held + 1
+        check(U[o].alive == 1, "cell %d is owned by dead slot %d", c, o)
+        local found = false
+        for k = 0, U[o].ncells - 1 do
+          if cells[o * MAXCELLS + k] == c then found = true end
+        end
+        check(found, "cell %d says slot %d owns it, but that unit does not list it", c, o)
+      end
+    end
+    local listed = 0
+    for k = 0, nlive - 1 do
+      local i = live[k]
+      local u = U[i]
+      check(u.ncells <= MAXCELLS, "unit %d holds %d cells, over the cap of %d", i, u.ncells, MAXCELLS)
+      listed = listed + u.ncells
+      for a = 0, u.ncells - 1 do
+        local c = cells[i * MAXCELLS + a]
+        check(c >= 0 and c < NC and own[c] == i, "unit %d lists cell %d, which is owned by %d", i, c, c >= 0 and c < NC and own[c] or -2)
+        for b = 0, a - 1 do
+          check(cells[i * MAXCELLS + b] ~= c, "unit %d lists cell %d twice", i, c)
+        end
+      end
+    end
+    check(held == listed, "%d cells name an owner but %d are listed by their owners", held, listed)
+  end
+
   for k = 0, NFLASH - 1 do
     check(flashes[k].kind <= 4 and flashes[k].ttl <= 24, "flash %d kind=%d ttl=%d", k, flashes[k].kind, flashes[k].ttl)
   end
@@ -1597,6 +1786,8 @@ function M.validate()
   check(s.gini >= -1e-9 and s.gini <= 1 and s.top1 >= 0 and s.top1 <= 1 + 1e-9, "gini=%g top1=%g", s.gini, s.top1)
   check(s.artisans <= s.pop and s.stubborn <= s.pop, "artisans/stubborn exceed pop")
   check(s.lines >= (alive > 0 and 1 or 0) and s.lines <= min(alive, ndyn), "%d surviving lines among %d units", s.lines, alive)
+  check(finite(REF[0]) and REF[0] > 0 and finite(REF[1]) and REF[1] > 0, "reference prices %g / %g must stay positive: rent is charged at them", REF[0], REF[1])
+  check(not enc or (s.owned >= 0 and s.owned <= 1 and s.landlords + s.landless == alive), "%d landlords + %d landless ~= %d alive", s.landlords, s.landless, alive)
   check(s.top_line >= 0 and s.top_line <= 1 + 1e-9 and s.top_line_worth >= 0 and s.top_line_worth <= 1 + 1e-9, "line shares %g / %g", s.top_line, s.top_line_worth)
   local d = M.deaths
   check(d.n == d.cause[1] + d.cause[2], "%d deaths recorded, %d by cause", d.n, d.cause[1] + d.cause[2])
@@ -1633,7 +1824,7 @@ local function fingerprint()
   local h = commons + tick
   for i = 0, MASK do
     local u = U[i]
-    if u.alive == 1 then h = (h * 31 + u.money + floor(u.x * 64) + floor(u.y * 64) * 3 + floor(u.stock[0] * 16) + i) % 2147483647 end
+    if u.alive == 1 then h = (h * 31 + u.money + floor(u.x * 64) + floor(u.y * 64) * 3 + floor(u.stock[0] * 16) + u.ncells * 7 + i) % 2147483647 end
   end
   return h
 end
