@@ -18,7 +18,7 @@ local SEEK_RICH, SEEK_KIN, MIGRATE, REPRO, ENDOW, INHERIT, BORROW, BUILD = 9, 10
 local SPECULATE, PEDDLE, CRAFT = 17, 18, 19
 local FOOD, TOOLS = 0, 1
 
-ffi.cdef [[
+ffi.cdef([[
 typedef struct {
   float x, y, vx, vy;
   double money, debt, lent;
@@ -35,21 +35,51 @@ typedef struct {
   uint8_t active;
 } loan_t;
 typedef struct { float x, y; uint8_t kind, ttl; } flash_t;
-]]
+]])
 
 local M = {
-  CAP = CAP, W = W, GRID = GRID, CELL = CELL, NG = NG, HN = HN, NFLASH = NFLASH,
-  GENES = { "productivity", "reserve", "greed", "herd", "thrift", "invest", "risk", "trust", "speed",
-    "seek_rich", "seek_kin", "migrate", "repro_thresh", "endowment", "inherit", "borrow", "build", "speculate", "peddle", "craft" },
+  CAP = CAP,
+  W = W,
+  GRID = GRID,
+  CELL = CELL,
+  NG = NG,
+  HN = HN,
+  NFLASH = NFLASH,
+  GENES = {
+    "productivity",
+    "reserve",
+    "greed",
+    "herd",
+    "thrift",
+    "invest",
+    "risk",
+    "trust",
+    "speed",
+    "seek_rich",
+    "seek_kin",
+    "migrate",
+    "repro_thresh",
+    "endowment",
+    "inherit",
+    "borrow",
+    "build",
+    "speculate",
+    "peddle",
+    "craft",
+  },
   FLASH = { TRADE = 0, BIRTH = 1, DEATH = 2, DEFAULT = 3, LOAN = 4 },
-  knobs = { pop = 2000, money = 1500, artisans = 0.15, yield = 2.6, toolrate = 0.5, mut = 0.05, estate_tax = 0.0,
-    shock_every = 600, stubborn_founders = 0.2, stubborn_birth = 0.02 },
+  knobs = { pop = 2000, money = 1500, artisans = 0.15, yield = 2.6, toolrate = 0.5, mut = 0.05, estate_tax = 0.0, shock_every = 600, stubborn_founders = 0.2, stubborn_birth = 0.02 },
   KNOB_HELP = {
-    pop = "founding population (1..16384)", money = "money per founder; total supply = pop x money, fixed forever",
-    artisans = "fraction of founders who start as tool-makers on ore land", yield = "food per unit labour on perfect land",
-    toolrate = "tools per unit labour on perfect ore", mut = "per-gene mutation sigma at birth",
-    estate_tax = "share of every estate paid to the commons dividend", shock_every = "mean ticks between crop failures, 0 = never",
-    stubborn_founders = "fraction of founders who never adapt", stubborn_birth = "chance an adaptive unit's child is stubborn",
+    pop = "founding population (1..16384)",
+    money = "money per founder; total supply = pop x money, fixed forever",
+    artisans = "fraction of founders who start as tool-makers on ore land",
+    yield = "food per unit labour on perfect land",
+    toolrate = "tools per unit labour on perfect ore",
+    mut = "per-gene mutation sigma at birth",
+    estate_tax = "share of every estate paid to the commons dividend",
+    shock_every = "mean ticks between crop failures, 0 = never",
+    stubborn_founders = "fraction of founders who never adapt",
+    stubborn_birth = "chance an adaptive unit's child is stubborn",
   },
   shock = { x = 0, y = 0, r = 0, ttl = 0 },
   stats = {},
@@ -92,15 +122,23 @@ local function paint(u)
   local x = c * (1 - abs((h / 60) % 2 - 1))
   local m = v - c
   local r, g, bl
-  if h < 60 then r, g, bl = c, x, 0 elseif h < 120 then r, g, bl = x, c, 0
-  elseif h < 180 then r, g, bl = 0, c, x elseif h < 240 then r, g, bl = 0, x, c
-  elseif h < 300 then r, g, bl = x, 0, c else r, g, bl = c, 0, x end
+  if h < 60 then
+    r, g, bl = c, x, 0
+  elseif h < 120 then
+    r, g, bl = x, c, 0
+  elseif h < 180 then
+    r, g, bl = 0, c, x
+  elseif h < 240 then
+    r, g, bl = 0, x, c
+  elseif h < 300 then
+    r, g, bl = x, 0, c
+  else
+    r, g, bl = c, 0, x
+  end
   u.hue, u.cr, u.cg, u.cb = h, (r + m) * 255, (g + m) * 255, (bl + m) * 255
 end
 
-local function gauss()
-  return sqrt(-2 * log(1 - random())) * math.cos(6.283185307 * random())
-end
+local function gauss() return sqrt(-2 * log(1 - random())) * math.cos(6.283185307 * random()) end
 
 local function wrap(v)
   v = v - W * floor(v / W)
@@ -123,36 +161,49 @@ local reset_scratch
 function M.init(seed)
   -- fixed seed: hue projection must match across runs so colors are comparable
   math.randomseed(1234)
-  for k = 0, NG * 2 - 1 do proj[k] = gauss() end
+  for k = 0, NG * 2 - 1 do
+    proj[k] = gauss()
+  end
   math.randomseed(seed or os.time())
 
-  ffi.fill(U, ffi.sizeof(U)); ffi.fill(L, ffi.sizeof(L)); ffi.fill(flashes, ffi.sizeof(flashes))
+  ffi.fill(U, ffi.sizeof(U))
+  ffi.fill(L, ffi.sizeof(L))
+  ffi.fill(flashes, ffi.sizeof(flashes))
   ffi.fill(hist, ffi.sizeof(hist))
   tick, commons, loan_hi, ndying = 0, 0, 0, 0
-  ffi.fill(sup, ffi.sizeof(sup)); ffi.fill(dem, ffi.sizeof(dem))
+  ffi.fill(sup, ffi.sizeof(sup))
+  ffi.fill(dem, ffi.sizeof(dem))
   reset_scratch()
   flash_head, M.shock.x, M.shock.y, M.shock.r = 0, 0, 0, 0
   c_births, c_starved, c_aged, c_defaults, c_trades, c_volume, c_loans, c_spec, c_tool_vol = 0, 0, 0, 0, 0, 0, 0, 0, 0
   nfree, nfree_loans = CAP, MAXLOANS
-  for i = 0, CAP - 1 do free_units[i] = CAP - 1 - i end
-  for i = 0, MAXLOANS - 1 do free_loans[i] = MAXLOANS - 1 - i end
+  for i = 0, CAP - 1 do
+    free_units[i] = CAP - 1 - i
+  end
+  for i = 0, MAXLOANS - 1 do
+    free_loans[i] = MAXLOANS - 1 - i
+  end
   M.shock.ttl = 0
 
   local w = 6.283185307 / GRID
   for k = 0, NC, NC do
     local ph = {}
-    for n = 1, 8 do ph[n] = random() * 6.283185307 end
+    for n = 1, 8 do
+      ph[n] = random() * 6.283185307
+    end
     for cy = 0, GRID - 1 do
       for cx = 0, GRID - 1 do
         local f = math.sin(cx * w + ph[1]) * math.sin(cy * w * 2 + ph[2])
-            + math.sin(cx * w * 3 + ph[3]) * math.sin(cy * w + ph[4]) * 0.7
-            + math.sin(cx * w * 5 + ph[5]) * math.sin(cy * w * 4 + ph[6]) * 0.4
-            + math.sin((cx + cy) * w * 2 + ph[7]) * 0.5
+          + math.sin(cx * w * 3 + ph[3]) * math.sin(cy * w + ph[4]) * 0.7
+          + math.sin(cx * w * 5 + ph[5]) * math.sin(cy * w * 4 + ph[6]) * 0.4
+          + math.sin((cx + cy) * w * 2 + ph[7]) * 0.5
         res[k + cy * GRID + cx] = max(0.05, min(1, 0.5 + f * 0.3))
       end
     end
   end
-  for c = 0, NC * 2 - 1 do opp[c] = res[c] end
+  for c = 0, NC * 2 - 1 do
+    opp[c] = res[c]
+  end
 
   M.check_knobs()
   local kn = M.knobs
@@ -163,7 +214,9 @@ function M.init(seed)
       x, y = random() * W, random() * W
     until field[floor(y / CELL) * GRID + floor(x / CELL)] > 0.55
     local _, u = spawn(x, y)
-    for k = 0, NG - 1 do u.g[k] = random() end
+    for k = 0, NG - 1 do
+      u.g[k] = random()
+    end
     -- uniform-random founders are ~95% unviable at this yield; bias toward farmers to skip the long bottleneck
     u.g[PROD], u.g[CRAFT] = 0.6 + 0.4 * random(), field == ore and 1 - 0.15 * random() or 0.15 * random()
     u.money, u.stock[FOOD], u.capital, u.age = kn.money, 300, 10, random(0, 2500)
@@ -176,7 +229,9 @@ function M.init(seed)
 end
 
 local function build_grid()
-  for c = 0, NC do cell_start[c] = 0 end
+  for c = 0, NC do
+    cell_start[c] = 0
+  end
   for i = 0, MASK do
     local u = U[i]
     if u.alive == 1 then
@@ -185,8 +240,12 @@ local function build_grid()
       cell_start[c + 1] = cell_start[c + 1] + 1
     end
   end
-  for c = 1, NC do cell_start[c] = cell_start[c] + cell_start[c - 1] end
-  for c = 0, NC do cell_cursor[c] = cell_start[c] end
+  for c = 1, NC do
+    cell_start[c] = cell_start[c] + cell_start[c - 1]
+  end
+  for c = 0, NC do
+    cell_cursor[c] = cell_start[c]
+  end
   for i = 0, MASK do
     local u = U[i]
     if u.alive == 1 then
@@ -203,9 +262,9 @@ local function kill(i, u)
   flash(u.x, u.y, 2)
 end
 
-ffi.cdef [[
+ffi.cdef([[
 typedef struct { double rich_m; float bel_sum[2], best_ask[2], rdx, rdy, kdx, kdy, px, py; int32_t nn, best[2], cand; } scan_t;
-]]
+]])
 local MAXPAIRS = CAP * 48
 local SC = ffi.new("scan_t[?]", CAP)
 local pair_i, pair_j = ffi.new("int32_t[?]", MAXPAIRS), ffi.new("int32_t[?]", MAXPAIRS)
@@ -219,8 +278,12 @@ local unmet = ffi.new("double[8]")
 
 -- scratch carries last tick's scan into produce(); stale values from a previous run made reseeded runs diverge
 function reset_scratch()
-  ffi.fill(SC, ffi.sizeof(SC)); ffi.fill(sc_ax, ffi.sizeof(sc_ax)); ffi.fill(sc_ay, ffi.sizeof(sc_ay))
-  ffi.fill(sc_scale, ffi.sizeof(sc_scale)); ffi.fill(sc_net, ffi.sizeof(sc_net)); ffi.fill(cell_start, ffi.sizeof(cell_start))
+  ffi.fill(SC, ffi.sizeof(SC))
+  ffi.fill(sc_ax, ffi.sizeof(sc_ax))
+  ffi.fill(sc_ay, ffi.sizeof(sc_ay))
+  ffi.fill(sc_scale, ffi.sizeof(sc_scale))
+  ffi.fill(sc_net, ffi.sizeof(sc_net))
+  ffi.fill(cell_start, ffi.sizeof(cell_start))
 end
 
 local function upkeep_of(g) return 0.6 + 0.8 * g[PROD] end
@@ -273,7 +336,8 @@ end
 
 -- 16px vision can't find a market: supply/demand per cell, max-propagated with decay, gives a gradient to the nearest one
 local function update_fields(pop)
-  ffi.fill(sup_raw, ffi.sizeof(sup_raw)); ffi.fill(dem_raw, ffi.sizeof(dem_raw))
+  ffi.fill(sup_raw, ffi.sizeof(sup_raw))
+  ffi.fill(dem_raw, ffi.sizeof(dem_raw))
   for s = 0, pop - 1 do
     local u = U[cell_items[s]]
     local c, solvent = u.cell, min(1, u.money)
@@ -333,10 +397,16 @@ local function phase_scan(pop)
       a.nn, a.bel_sum[0], a.bel_sum[1] = nn, a.bel_sum[0] + o.belief[0], a.bel_sum[1] + o.belief[1]
       -- jittered ask: without it every buyer mobs the single cheapest seller and most orders fail
       local jit = 1 + 0.3 * random()
-      if o.surplus[0] > 0.5 and o.ask[0] * jit < a.best_ask[0] then a.best[0], a.best_ask[0] = j, o.ask[0] * jit end
-      if o.surplus[1] > 0.05 and o.ask[1] * jit < a.best_ask[1] then a.best[1], a.best_ask[1] = j, o.ask[1] * jit end
+      if o.surplus[0] > 0.5 and o.ask[0] * jit < a.best_ask[0] then
+        a.best[0], a.best_ask[0] = j, o.ask[0] * jit
+      end
+      if o.surplus[1] > 0.05 and o.ask[1] * jit < a.best_ask[1] then
+        a.best[1], a.best_ask[1] = j, o.ask[1] * jit
+      end
       if random() * nn < 1 then a.cand = j end
-      if o.money > a.rich_m then a.rich_m, a.rdx, a.rdy = o.money, dx, dy end
+      if o.money > a.rich_m then
+        a.rich_m, a.rdx, a.rdy = o.money, dx, dy
+      end
       local kw = 1 - (180 - abs(abs(o.hue - u.hue) - 180)) / 90
       local pw = max(0, 1 - d2 / 64)
       a.kdx, a.kdy, a.px, a.py = a.kdx + dx * kw, a.kdy + dy * kw, a.px - dx * pw, a.py - dy * pw
@@ -372,12 +442,8 @@ local function phase_scan(pop)
     local here = res[ko + cell] / (0.5 + 0.5 * (cell_start[cell + 1] - cell_start[cell]))
     local gain = max(0, min(1, max(opp[ko + l], opp[ko + r], opp[ko + up], opp[ko + dn]) / (here + 0.01) - 1.15))
     local settle = g[MIGRATE] * 200 * gain * (1 - h01) / (opp[ko + cell] + 0.01)
-    sc_ax[i] = open * (a.rdx * wr + a.kdx * wk + (random() - 0.5) * 0.3 + (dem[k + r] - dem[k + l]) * wd
-        + (sup[r] - sup[l]) * w0 + (sup[NC + r] - sup[NC + l]) * w1
-        + (opp[ko + r] - opp[ko + l]) * settle)
-    sc_ay[i] = open * (a.rdy * wr + a.kdy * wk + (random() - 0.5) * 0.3 + (dem[k + dn] - dem[k + up]) * wd
-        + (sup[dn] - sup[up]) * w0 + (sup[NC + dn] - sup[NC + up]) * w1
-        + (opp[ko + dn] - opp[ko + up]) * settle)
+    sc_ax[i] = open * (a.rdx * wr + a.kdx * wk + (random() - 0.5) * 0.3 + (dem[k + r] - dem[k + l]) * wd + (sup[r] - sup[l]) * w0 + (sup[NC + r] - sup[NC + l]) * w1 + (opp[ko + r] - opp[ko + l]) * settle)
+    sc_ay[i] = open * (a.rdy * wr + a.kdy * wk + (random() - 0.5) * 0.3 + (dem[k + dn] - dem[k + up]) * wd + (sup[dn] - sup[up]) * w0 + (sup[NC + dn] - sup[NC + up]) * w1 + (opp[ko + dn] - opp[ko + up]) * settle)
   end
 end
 
@@ -437,9 +503,7 @@ local function phase_lend(pop, start, stride)
       local amount = floor(spare * (0.1 + 0.4 * g[INVEST]))
       local o = U[cand]
       local rate = 0.05 + 0.5 * g[GREED]
-      if amount >= 50 and o.alive == 1
-          and o.debt / (o.money + 1) < 0.2 + 3 * g[RISK] and tick - o.default_tick > 4000 * (1 - g[RISK])
-          and rate <= 0.05 + 0.6 * o.g[BORROW] and o.debt < 5000 * o.g[BORROW] then
+      if amount >= 50 and o.alive == 1 and o.debt / (o.money + 1) < 0.2 + 3 * g[RISK] and tick - o.default_tick > 4000 * (1 - g[RISK]) and rate <= 0.05 + 0.6 * o.g[BORROW] and o.debt < 5000 * o.g[BORROW] then
         nfree_loans = nfree_loans - 1
         local li = free_loans[nfree_loans]
         loan_hi = max(loan_hi, li + 1)
@@ -486,9 +550,7 @@ local function phase_birth(pop)
     local i = cell_items[s]
     local u = U[i]
     local g, cell = u.g, u.cell
-    if u.alive == 1 and nfree > 0 and u.age > 300 and u.surplus[FOOD] >= 0 and u.stock[FOOD] >= 60 + upkeep_of(g) * 10
-        and SC[i].nn < 8
-        and u.money - u.debt > 300 + 3000 * g[REPRO] and random() < 0.02 then
+    if u.alive == 1 and nfree > 0 and u.age > 300 and u.surplus[FOOD] >= 0 and u.stock[FOOD] >= 60 + upkeep_of(g) * 10 and SC[i].nn < 8 and u.money - u.debt > 300 + 3000 * g[REPRO] and random() < 0.02 then
       local frac = 0.1 + 0.4 * g[ENDOW]
       -- children set out for better land: greedy climb of the opportunity field, since walking there on a 30-tick food buffer is a death march
       local ko, at = g[CRAFT] > 0.5 and NC or 0, cell
@@ -509,7 +571,9 @@ local function phase_birth(pop)
         ffi.copy(c.g, g, ffi.sizeof(c.g))
         c.stubborn = 1
       else
-        for k = 0, NG - 1 do c.g[k] = max(0, min(1, g[k] + gauss() * mut)) end
+        for k = 0, NG - 1 do
+          c.g[k] = max(0, min(1, g[k] + gauss() * mut))
+        end
         -- career change: squared labour shares leave a fitness valley at craft~0.5 that small mutations can't cross
         if random() < 0.03 then c.g[CRAFT] = 1 - c.g[CRAFT] end
         c.stubborn = random() < M.knobs.stubborn_birth and 1 or 0
@@ -596,7 +660,9 @@ local function bury()
       end
     end
     local share = floor(estate / max(1, nn))
-    for t = 0, nn - 1 do U[heirs[t]].money = U[heirs[t]].money + share end
+    for t = 0, nn - 1 do
+      U[heirs[t]].money = U[heirs[t]].money + share
+    end
     estate = estate - share * nn
     commons = commons + estate
     u.money, u.alive, u.gen = 0, 0, u.gen + 1
@@ -611,8 +677,11 @@ function M.tick()
   build_grid()
 
   local sh = M.shock
-  if sh.ttl > 0 then sh.ttl = sh.ttl - 1
-  elseif M.knobs.shock_every > 0 and random() < 1 / M.knobs.shock_every then M.trigger_shock() end
+  if sh.ttl > 0 then
+    sh.ttl = sh.ttl - 1
+  elseif M.knobs.shock_every > 0 and random() < 1 / M.knobs.shock_every then
+    M.trigger_shock()
+  end
 
   local pop = cell_start[NC]
   local dbg = M.debug
@@ -677,7 +746,9 @@ function M.compute_stats()
   local s = M.stats
   local n, price, debt, artisans, capital, stubborn = 0, 0, 0, 0, 0, 0
   local means = {}
-  for k = 1, NG do means[k] = 0 end
+  for k = 1, NG do
+    means[k] = 0
+  end
   for i = 0, MASK do
     local u = U[i]
     if u.alive == 1 then
@@ -688,10 +759,14 @@ function M.compute_stats()
       if u.g[CRAFT] > 0.5 then artisans = artisans + 1 end
       stubborn = stubborn + u.stubborn
       debt = debt + u.debt
-      for k = 1, NG do means[k] = means[k] + u.g[k - 1] end
+      for k = 1, NG do
+        means[k] = means[k] + u.g[k - 1]
+      end
     end
   end
-  for k = #wealth, n + 1, -1 do wealth[k], prices[k], tprices[k] = nil, nil, nil end
+  for k = #wealth, n + 1, -1 do
+    wealth[k], prices[k], tprices[k] = nil, nil, nil
+  end
   table.sort(prices)
   table.sort(tprices)
   s.stubborn = stubborn
@@ -700,29 +775,41 @@ function M.compute_stats()
   table.sort(wealth)
   s.median_worth = max(1, wealth[floor(n / 2) + 1] or 1)
   local cum, total = 0, 0
-  for k = 1, n do cum, total = cum + k * wealth[k], total + wealth[k] end
+  for k = 1, n do
+    cum, total = cum + k * wealth[k], total + wealth[k]
+  end
   s.gini = (n > 0 and total > 0) and (2 * cum / (n * total) - (n + 1) / n) or 0
   s.top1 = 0
-  for k = max(1, n - floor(n / 100) + 1), n do s.top1 = s.top1 + wealth[k] end
+  for k = max(1, n - floor(n / 100) + 1), n do
+    s.top1 = s.top1 + wealth[k]
+  end
   s.top1 = total > 0 and s.top1 / total or 0
-  for b = 1, 24 do s.wealth_bins[b] = 0 end
+  for b = 1, 24 do
+    s.wealth_bins[b] = 0
+  end
   for k = 1, n do
     local b = min(24, 1 + floor(log(wealth[k] + 1) / log(10) * 4))
     s.wealth_bins[b] = s.wealth_bins[b] + 1
   end
-  for k = 1, NG do means[k] = n > 0 and means[k] / n or 0 end
+  for k = 1, NG do
+    means[k] = n > 0 and means[k] / n or 0
+  end
   s.pop, s.price, s.debt, s.means, s.tick, s.commons = n, price, debt, means, tick, commons
   s.nloans = MAXLOANS - nfree_loans
   s.births, s.starved, s.aged, s.defaults = c_births, c_starved, c_aged, c_defaults
   s.trades, s.volume, s.new_loans, s.spec, s.tool_volume = c_trades, c_volume, c_loans, c_spec, c_tool_vol
   c_spec, c_tool_vol = 0, 0
   s.unmet = s.unmet or {}
-  for k = 0, 7 do s.unmet[k], unmet[k] = unmet[k], 0 end
+  for k = 0, 7 do
+    s.unmet[k], unmet[k] = unmet[k], 0
+  end
   c_births, c_starved, c_aged, c_defaults, c_trades, c_volume, c_loans = 0, 0, 0, 0, 0, 0, 0
 
   local h = s.hist_head
   hist[0 * HN + h], hist[1 * HN + h], hist[2 * HN + h], hist[3 * HN + h] = n, s.gini, s.price, s.tool_price
-  for k = 1, NG do hist[(3 + k) * HN + h] = means[k] end
+  for k = 1, NG do
+    hist[(3 + k) * HN + h] = means[k]
+  end
   s.hist_head, s.hist_n = (h + 1) % HN, min(HN, s.hist_n + 1)
 end
 
@@ -744,8 +831,7 @@ do
   check(R2 <= CELL * CELL, "interaction radius %g exceeds cell size %d: the 3x3 scan would miss neighbours", sqrt(R2), CELL)
   check(#M.GENES == NG, "GENES has %d names for %d genes", #M.GENES, NG)
   check(ffi.sizeof("unit_t") > 0 and ffi.sizeof(U[0].g) == NG * 4, "unit_t.g holds %d floats, NG is %d", ffi.sizeof(U[0].g) / 4, NG)
-  local idx = { PROD, RESERVE, GREED, HERD, THRIFT, INVEST, RISK, TRUST, SPEED, SEEK_RICH, SEEK_KIN, MIGRATE, REPRO, ENDOW,
-    INHERIT, BORROW, BUILD, SPECULATE, PEDDLE, CRAFT }
+  local idx = { PROD, RESERVE, GREED, HERD, THRIFT, INVEST, RISK, TRUST, SPEED, SEEK_RICH, SEEK_KIN, MIGRATE, REPRO, ENDOW, INHERIT, BORROW, BUILD, SPECULATE, PEDDLE, CRAFT }
   check(#idx == NG, "%d gene index constants for %d genes", #idx, NG)
   local seen = {}
   for _, k in ipairs(idx) do
@@ -754,12 +840,13 @@ do
   end
   for _, p in ipairs(PRIMES) do
     check(p > CAP, "stride %d must exceed CAP so it is coprime with every population size", p)
-    for d = 2, floor(sqrt(p)) do check(p % d ~= 0, "stride %d is not prime", p) end
+    for d = 2, floor(sqrt(p)) do
+      check(p % d ~= 0, "stride %d is not prime", p)
+    end
   end
   check(MAXPAIRS >= CAP * 9, "pair buffer too small")
   check(ffi.sizeof(hist) == (4 + NG) * HN * 4, "hist buffer does not match 4 + NG series")
-  check(ffi.sizeof(res) == NC * 2 * 4 and ffi.sizeof(opp) == ffi.sizeof(res) and ffi.sizeof(sup) == ffi.sizeof(res)
-    and ffi.sizeof(dem) == ffi.sizeof(res), "field buffers must hold 2 goods x NC cells")
+  check(ffi.sizeof(res) == NC * 2 * 4 and ffi.sizeof(opp) == ffi.sizeof(res) and ffi.sizeof(sup) == ffi.sizeof(res) and ffi.sizeof(dem) == ffi.sizeof(res), "field buffers must hold 2 goods x NC cells")
   check(TERM > 0, "TERM must be positive")
   check(FOOD == 0 and TOOLS == 1, "goods are indexed 0/1 by phase_trade and the k=0,NC,NC field loops")
   check(CARRY[0] > MINQ[0] and CARRY[1] > MINQ[1], "CARRY must exceed MINQ or speculation can never trade")
@@ -883,7 +970,9 @@ function M.validate()
         check(finite(u.ask[k]) and u.ask[k] >= 0 and finite(u.surplus[k]), "unit %d ask/surplus[%d] not finite", i, k)
         check(u.surplus[k] <= u.stock[k] + 1e-3, "unit %d offers more of good %d (%g) than it holds (%g)", i, k, u.surplus[k], u.stock[k])
       end
-      for k = 0, NG - 1 do check(u.g[k] >= 0 and u.g[k] <= 1, "unit %d gene %s=%g outside [0,1]", i, M.GENES[k + 1], u.g[k]) end
+      for k = 0, NG - 1 do
+        check(u.g[k] >= 0 and u.g[k] <= 1, "unit %d gene %s=%g outside [0,1]", i, M.GENES[k + 1], u.g[k])
+      end
       debt[i], lent[i], nl[i] = 0, 0, 0
     end
   end
@@ -928,7 +1017,9 @@ function M.validate()
     check(U[i].nloans == nl[i], "unit %d nloans %d ~= %d loans it holds", i, U[i].nloans, nl[i])
   end
 
-  for k = 0, NFLASH - 1 do check(flashes[k].kind <= 4 and flashes[k].ttl <= 24, "flash %d kind=%d ttl=%d", k, flashes[k].kind, flashes[k].ttl) end
+  for k = 0, NFLASH - 1 do
+    check(flashes[k].kind <= 4 and flashes[k].ttl <= 24, "flash %d kind=%d ttl=%d", k, flashes[k].kind, flashes[k].ttl)
+  end
   local sh = M.shock
   check(sh.ttl >= 0 and (sh.ttl == 0 or (sh.r > 0 and sh.x >= 0 and sh.x < W and sh.y >= 0 and sh.y < W)), "shock state invalid")
 
@@ -938,14 +1029,20 @@ function M.validate()
   check(s.gini >= -1e-9 and s.gini <= 1 and s.top1 >= 0 and s.top1 <= 1 + 1e-9, "gini=%g top1=%g", s.gini, s.top1)
   check(s.artisans <= s.pop and s.stubborn <= s.pop, "artisans/stubborn exceed pop")
   local bins = 0
-  for b = 1, 24 do bins = bins + s.wealth_bins[b] end
+  for b = 1, 24 do
+    bins = bins + s.wealth_bins[b]
+  end
   check(bins == alive, "wealth histogram counts %d of %d units", bins, alive)
-  for k = 1, NG do check(s.means[k] >= 0 and s.means[k] <= 1, "gene mean %s=%g", M.GENES[k], s.means[k]) end
+  for k = 1, NG do
+    check(s.means[k] >= 0 and s.means[k] <= 1, "gene mean %s=%g", M.GENES[k], s.means[k])
+  end
   check(s.hist_n >= 1 and s.hist_n <= HN and s.hist_head >= 0 and s.hist_head < HN, "history ring indices")
 end
 
 local DEFAULTS = {}
-for k, v in pairs(M.knobs) do DEFAULTS[k] = v end
+for k, v in pairs(M.knobs) do
+  DEFAULTS[k] = v
+end
 
 local function fingerprint()
   local h = commons + tick
@@ -980,8 +1077,12 @@ end
 -- "--key=value" for any knob plus caller-declared extras; unknown keys and non-numbers are errors, not silently ignored
 function M.parse_args(argv, extras)
   local out, names = {}, {}
-  for k in pairs(M.knobs) do names[#names + 1] = k end
-  for k in pairs(extras) do names[#names + 1] = k end
+  for k in pairs(M.knobs) do
+    names[#names + 1] = k
+  end
+  for k in pairs(extras) do
+    names[#names + 1] = k
+  end
   table.sort(names)
   for _, a in ipairs(argv) do
     local key, val = a:match("^%-%-([%w_-]+)=?(.*)$")
@@ -1000,7 +1101,11 @@ function M.parse_args(argv, extras)
       io.stderr:write(("--%s needs a number, got '%s'\n"):format(key, val))
       os.exit(2)
     end
-    if M.knobs[key] ~= nil then M.knobs[key] = num else out[key] = num end
+    if M.knobs[key] ~= nil then
+      M.knobs[key] = num
+    else
+      out[key] = num
+    end
   end
   local ok, err = pcall(M.check_knobs)
   if not ok then

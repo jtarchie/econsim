@@ -13,26 +13,33 @@ local WHITE, DIM, PANEL, BG = color(230, 230, 230), color(150, 150, 150), color(
 local FLASH_RGB = { [0] = { 255, 255, 255 }, { 80, 255, 120 }, { 255, 60, 60 }, { 255, 170, 40 }, { 80, 160, 255 } }
 
 -- fail before the window opens: every raylib symbol must resolve, struct layouts must match the C ABI, and the sim must pass its audit
-for _, name in ipairs({ "SetConfigFlags", "SetTraceLogLevel", "InitWindow", "CloseWindow", "WindowShouldClose", "GetScreenWidth",
-  "GetScreenHeight", "SetTargetFPS", "GetFPS", "BeginDrawing", "EndDrawing", "ClearBackground", "TakeScreenshot", "GetTime",
-  "IsKeyPressed", "IsKeyDown", "IsMouseButtonPressed", "IsMouseButtonDown", "IsMouseButtonReleased", "GetMouseX", "GetMouseY",
-  "GetMouseDelta", "GetMouseWheelMove", "DrawText", "DrawRectangle", "GenImageGradientRadial", "LoadTextureFromImage",
-  "UnloadImage", "SetTextureFilter", "UpdateTexture", "rlPushMatrix", "rlPopMatrix", "rlTranslatef", "rlScalef", "rlBegin",
-  "rlEnd", "rlVertex2f", "rlTexCoord2f", "rlColor4ub", "rlSetTexture", "rlCheckRenderBatchLimit", "rlDrawRenderBatchActive" }) do
+local RAYLIB_SYMBOLS = [[
+  SetConfigFlags SetTraceLogLevel InitWindow CloseWindow WindowShouldClose GetScreenWidth GetScreenHeight SetTargetFPS GetFPS BeginDrawing EndDrawing ClearBackground TakeScreenshot GetTime IsKeyPressed IsKeyDown
+  IsMouseButtonPressed IsMouseButtonDown IsMouseButtonReleased GetMouseX GetMouseY GetMouseDelta GetMouseWheelMove DrawText DrawRectangle GenImageGradientRadial LoadTextureFromImage UnloadImage SetTextureFilter
+  UpdateTexture rlPushMatrix rlPopMatrix rlTranslatef rlScalef rlBegin rlEnd rlVertex2f rlTexCoord2f rlColor4ub rlSetTexture rlCheckRenderBatchLimit rlDrawRenderBatchActive
+]]
+for name in RAYLIB_SYMBOLS:gmatch("%S+") do
   assert(pcall(function() return rl[name] end), "raylib is missing symbol " .. name)
 end
 assert(ffi.sizeof("Color") == 4 and ffi.sizeof("Vector2") == 8 and ffi.sizeof("Texture2D") == 20, "raylib struct layout mismatch")
 assert(ffi.sizeof("Image") == ffi.sizeof("void *") + 16, "raylib Image layout mismatch")
 assert(#sim.GENES == NG and sim.GRID * sim.CELL == W, "sim exports inconsistent")
 local opt = sim.parse_args(arg, {
-  seed = "random seed (default: clock)", speed = "sim ticks per frame at start (default 2)",
-  shot = "save shot.png after this many frames and exit", no_selftest = "skip the startup audit",
+  seed = "random seed (default: clock)",
+  speed = "sim ticks per frame at start (default 2)",
+  shot = "save shot.png after this many frames and exit",
+  no_selftest = "skip the startup audit",
+  width = "window width (default 1280)",
+  height = "window height (default 800)",
+  zoom = "starting zoom, 1 = whole world fits (default 1)",
+  pick = "select the richest unit (for screenshots)",
 })
 if not opt.no_selftest then sim.selftest(100) end
 
 rl.SetTraceLogLevel(4)
 rl.SetConfigFlags(4 + 64)
-rl.InitWindow(1400, 900, "capitalism")
+-- 1280x800 fits any laptop desktop; a window taller than the screen loses its top strip to the macOS menu bar
+rl.InitWindow(opt.width or 1280, opt.height or 800, "capitalism")
 rl.SetTargetFPS(60)
 
 local img = rl.GenImageGradientRadial(64, 64, 0.8, color(255, 255, 255), color(255, 255, 255, 0))
@@ -61,24 +68,27 @@ local seed = opt.seed or os.time()
 sim.init(seed)
 paint_land()
 
-local zoom = 900 / W
-local cam_x, cam_y = 340, 0
+-- fit the world to window height, then nudge right of the 330px stats panel
+local zoom = (opt.zoom or 1) * rl.GetScreenHeight() / W
+local cam_x, cam_y = (rl.GetScreenWidth() - W * zoom) / 2 + 90, (rl.GetScreenHeight() - W * zoom) / 2
 local speed, paused, show_links, show_flash, show_ui = opt.speed or 2, false, true, true, true
 local sel, sel_gen, drag = -1, 0, 0
 local ticks_since_stats, tick_ms = 0, 0
 
 local function quad(x, y, r)
   rl.rlCheckRenderBatchLimit(4)
-  rl.rlTexCoord2f(0, 0); rl.rlVertex2f(x - r, y - r)
-  rl.rlTexCoord2f(0, 1); rl.rlVertex2f(x - r, y + r)
-  rl.rlTexCoord2f(1, 1); rl.rlVertex2f(x + r, y + r)
-  rl.rlTexCoord2f(1, 0); rl.rlVertex2f(x + r, y - r)
+  rl.rlTexCoord2f(0, 0)
+  rl.rlVertex2f(x - r, y - r)
+  rl.rlTexCoord2f(0, 1)
+  rl.rlVertex2f(x - r, y + r)
+  rl.rlTexCoord2f(1, 1)
+  rl.rlVertex2f(x + r, y + r)
+  rl.rlTexCoord2f(1, 0)
+  rl.rlVertex2f(x + r, y - r)
 end
 
 -- radius (not area) linear in worth relative to the median: deliberately exaggerated, area-true sizing looked uniform
-local function radius(u)
-  return max(1, min(60, 2.5 * sim.worth(u) / sim.stats.median_worth))
-end
+local function radius(u) return max(1, min(60, 2.5 * sim.worth(u) / sim.stats.median_worth)) end
 
 local function draw_world()
   rl.rlPushMatrix()
@@ -208,7 +218,9 @@ local function draw_ui()
 
   line("wealth distribution (log10 bins)", DIM)
   local peak = 1
-  for b = 1, 24 do peak = max(peak, s.wealth_bins[b]) end
+  for b = 1, 24 do
+    peak = max(peak, s.wealth_bins[b])
+  end
   for b = 1, 24 do
     local h = floor(s.wealth_bins[b] / peak * 50)
     rl.DrawRectangle(10 + (b - 1) * 13, y + 50 - h, 11, h, color(255, 200, 80))
@@ -241,7 +253,9 @@ local function draw_ui()
       ("food %.1f   tools %.1f   capital %.1f%s"):format(u.stock[0], u.stock[1], u.capital, u.stubborn == 1 and "   STUBBORN" or ""),
       ("belief food %.2f  tools %.2f   loans out %d"):format(u.belief[0], u.belief[1], u.nloans),
     }
-    for i, str in ipairs(rows) do rl.DrawText(str, x0 + 10, 8 + i * 14, 10, WHITE) end
+    for i, str in ipairs(rows) do
+      rl.DrawText(str, x0 + 10, 8 + i * 14, 10, WHITE)
+    end
     for g = 1, NG do
       local gy = 94 + g * 13
       rl.DrawText(sim.GENES[g], x0 + 10, gy, 10, WHITE)
@@ -258,7 +272,21 @@ local function pick(mx, my)
     local u = U[i]
     if u.alive == 1 then
       local d = (u.x - wx) ^ 2 + (u.y - wy) ^ 2
-      if d < best_d then best, best_d = i, d end
+      if d < best_d then
+        best, best_d = i, d
+      end
+    end
+  end
+  sel, sel_gen = best, best >= 0 and U[best].gen or 0
+end
+
+-- screenshot helper: --pick opens the inspector on whoever is richest at shot time
+local function pick_richest()
+  local best, best_w = -1, -1
+  for i = 0, CAP - 1 do
+    local u = U[i]
+    if u.alive == 1 and sim.worth(u) > best_w then
+      best, best_w = i, sim.worth(u)
     end
   end
   sel, sel_gen = best, best >= 0 and U[best].gen or 0
@@ -301,7 +329,9 @@ while not rl.WindowShouldClose() do
 
   if not paused then
     local t0 = rl.GetTime()
-    for _ = 1, speed do sim.tick() end
+    for _ = 1, speed do
+      sim.tick()
+    end
     tick_ms = tick_ms * 0.9 + (rl.GetTime() - t0) * 1000 / speed * 0.1
     ticks_since_stats = ticks_since_stats + speed
     if ticks_since_stats >= 30 then
@@ -310,6 +340,8 @@ while not rl.WindowShouldClose() do
     end
   end
   if sel >= 0 and (U[sel].alive ~= 1 or U[sel].gen ~= sel_gen) then sel = -1 end
+
+  if opt.pick and shot and frames + 1 >= shot then pick_richest() end
 
   rl.BeginDrawing()
   rl.ClearBackground(BG)

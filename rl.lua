@@ -1,7 +1,7 @@
 -- struct-by-value FFI calls (Color etc.) are not JIT-compiled: overlay only, hot path uses rlgl scalars
 local ffi = require("ffi")
 
-ffi.cdef [[
+ffi.cdef([[
 typedef struct { unsigned char r, g, b, a; } Color;
 typedef struct { float x, y; } Vector2;
 typedef struct { void *data; int width, height, mipmaps, format; } Image;
@@ -53,7 +53,7 @@ void rlColor4ub(unsigned char r, unsigned char g, unsigned char b, unsigned char
 void rlSetTexture(unsigned int id);
 bool rlCheckRenderBatchLimit(int vCount);
 void rlDrawRenderBatchActive(void);
-]]
+]])
 
 local ok, lib = pcall(ffi.load, "raylib")
 if not ok then lib = ffi.load("/opt/homebrew/lib/libraylib.dylib") end
