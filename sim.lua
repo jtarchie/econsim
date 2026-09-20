@@ -337,6 +337,10 @@ typedef struct { float hue, bel0, bel1, ask0, ask1, sur0, sur1; double money; } 
 ]])
 local off_x = ffi.new("int32_t[9]", -1, 0, 1, -1, 0, 1, -1, 0, 1)
 local off_y = ffi.new("int32_t[9]", -1, -1, -1, 0, 0, 0, 1, 1, 1)
+-- forward half of the ring: with the home cell scanned only ahead of each unit, this visits
+-- every unordered pair exactly once instead of once from each end
+local off_hx = ffi.new("int32_t[4]", 1, -1, 0, 1)
+local off_hy = ffi.new("int32_t[4]", 0, 1, 1, 1)
 local CARRY, MINQ = ffi.new("float[2]", 300, 40), ffi.new("float[2]", 0.5, 0.05)
 local unmet = ffi.new("double[8]")
 
@@ -497,36 +501,47 @@ end
 -- The 3x3 block is 2304 square units but the interaction disc is only 804, so two thirds of
 -- candidates are out of range. Rejecting them here, in a loop that walks NB in cell order and
 -- touches nothing else, keeps them out of the branchy consumer below.
--- Every unit in a cell scans the same 3x3 block, so gather that block once into a small
+-- Every unit in a cell scans the same neighbour block, so gather that block once into a small
 -- contiguous scratch and let the whole cell test against it out of L1. Walking cell_items
--- per unit instead meant nine scattered streams re-read for every unit in the cell.
--- Cells and units are visited in cell_items order, so the pair list is byte-identical to a
--- per-unit walk; the chunk boundary just moves from a unit to a cell.
+-- per unit instead meant scattered streams re-read for every unit in the cell.
+--
+-- Only the forward half of the ring is scanned. Each unordered pair is therefore emitted once
+-- and the consumer applies it to both ends, which halves enumeration and halves the distance
+-- tests. Verlet lists were measured instead and rejected: units cover up to 31% of the
+-- interaction radius per tick, so the skin needed to stay conservative makes the cached list
+-- the same size as the grid's candidate set.
 local function build_pairs(c0)
   local P, c, limit = 0, c0, MAXPAIRS - blk_n * max_cell
   while c < NC do
     local lo, hi = cell_start[c], cell_start[c + 1]
     if hi > lo then
       local cx, cy, m = band(c, GMASK), floor(c * INV_GRID), 0
-      for n = 0, 8 do
-        local nx, ny = cx + off_x[n], cy + off_y[n]
+      for n = 0, 3 do
+        local nx, ny = cx + off_hx[n], cy + off_hy[n]
         -- the seam is a property of the neighbour cell, not of each candidate
         local ox = nx < 0 and -W or (nx >= GRID and W or 0)
         local oy = ny < 0 and -W or (ny >= GRID and W or 0)
         local nc = band(ny, GMASK) * GRID + band(nx, GMASK)
         for t = cell_start[nc], cell_start[nc + 1] - 1 do
-          blk_x[m], blk_y[m], blk_s[m] = px[t] + ox, py[t] + oy, t
+          blk_x[m], blk_y[m], blk_s[m] = px[t] + ox, py[t] + oy, cell_items[t]
           m = m + 1
         end
       end
       for s = lo, hi - 1 do
         local ux, uy, i = px[s], py[s], cell_items[s]
+        -- own cell, forward only: no self-compare needed, and no pair counted twice
+        for t = s + 1, hi - 1 do
+          local dx, dy = px[t] - ux, py[t] - uy
+          -- a dying unit carries a NaN position, so this rejects it without a flag load
+          if dx * dx + dy * dy < R2 then
+            pair_i[P], pair_j[P], pair_dx[P], pair_dy[P] = i, cell_items[t], dx, dy
+            P = P + 1
+          end
+        end
         for k = 0, m - 1 do
           local dx, dy = blk_x[k] - ux, blk_y[k] - uy
-          local t = blk_s[k]
-          -- a dying unit carries a NaN position, so this comparison rejects it without a flag load
-          if dx * dx + dy * dy < R2 and t ~= s then
-            pair_i[P], pair_j[P], pair_dx[P], pair_dy[P] = i, t, dx, dy
+          if dx * dx + dy * dy < R2 then
+            pair_i[P], pair_j[P], pair_dx[P], pair_dy[P] = i, blk_s[k], dx, dy
             P = P + 1
           end
         end
@@ -542,7 +557,7 @@ local function phase_scan(pop)
   -- gather the neighbour view once; the pair loop then reads it ~9 times per unit
   for s = 0, pop - 1 do
     local i = cell_items[s]
-    local u, b, a = U[i], NB[s], SC[i]
+    local u, b, a = U[i], NB[i], SC[i]
     -- NaN position = invisible to the pair filter; dying units must not be anyone's neighbour
     px[s], py[s] = u.alive == 1 and u.x or NAN, u.alive == 1 and u.y or NAN
     b.hue, b.money = u.hue, u.money
@@ -560,39 +575,54 @@ local function phase_scan(pop)
   repeat
     local P
     P, at = build_pairs(at)
-    -- a short per-unit inner loop lost to trace-entry overhead; one long flat loop wins even
-    -- though every accumulator is then a read-modify-write against SC
+    -- one long flat loop beats a short per-unit one: trace-entry overhead dominated there,
+    -- even though every accumulator here is a read-modify-write against SC
     for p = 0, P - 1 do
       local i, j = pair_i[p], pair_j[p]
-      local o, a = NB[j], SC[i]
+      local a, b = SC[i], SC[j]
+      local oi, oj = NB[i], NB[j]
       local dx, dy = pair_dx[p], pair_dy[p]
-      local hue = U[i].hue
-      local nn = a.nn + 1
-      a.nn, a.bel_sum[0], a.bel_sum[1] = nn, a.bel_sum[0] + o.bel0, a.bel_sum[1] + o.bel1
-      -- jittered ask: without it every buyer mobs the single cheapest seller and most orders fail
-      local jit = 1 + 0.3 * random()
-      if o.sur0 > 0.5 and o.ask0 * jit < a.best_ask[0] then
-        a.best[0], a.best_ask[0] = j, o.ask0 * jit
-      end
-      if o.sur1 > 0.05 and o.ask1 * jit < a.best_ask[1] then
-        a.best[1], a.best_ask[1] = j, o.ask1 * jit
-      end
-      if random() * nn < 1 then a.cand = j end
-      if o.money > a.rich_m then
-        a.rich_m, a.rdx, a.rdy = o.money, dx, dy
-      end
-      local kw = 1 - (180 - abs(abs(o.hue - hue) - 180)) / 90
+      local kw = 1 - (180 - abs(abs(oj.hue - oi.hue) - 180)) / 90
       local pw = max(0, 1 - (dx * dx + dy * dy) / 64)
+
+      local na = a.nn + 1
+      a.nn, a.bel_sum[0], a.bel_sum[1] = na, a.bel_sum[0] + oj.bel0, a.bel_sum[1] + oj.bel1
+      -- jittered ask: without it every buyer mobs the single cheapest seller and most orders fail
+      local ja = 1 + 0.3 * random()
+      if oj.sur0 > 0.5 and oj.ask0 * ja < a.best_ask[0] then
+        a.best[0], a.best_ask[0] = j, oj.ask0 * ja
+      end
+      if oj.sur1 > 0.05 and oj.ask1 * ja < a.best_ask[1] then
+        a.best[1], a.best_ask[1] = j, oj.ask1 * ja
+      end
+      if random() * na < 1 then a.cand = j end
+      if oj.money > a.rich_m then
+        a.rich_m, a.rdx, a.rdy = oj.money, dx, dy
+      end
       a.kdx, a.kdy, a.px, a.py = a.kdx + dx * kw, a.kdy + dy * kw, a.px - dx * pw, a.py - dy * pw
+
+      -- the same encounter seen from the other side: kinship and separation are symmetric,
+      -- the offset is negated, and each side draws its own ask jitter as it did before
+      local nb = b.nn + 1
+      b.nn, b.bel_sum[0], b.bel_sum[1] = nb, b.bel_sum[0] + oi.bel0, b.bel_sum[1] + oi.bel1
+      local jb = 1 + 0.3 * random()
+      if oi.sur0 > 0.5 and oi.ask0 * jb < b.best_ask[0] then
+        b.best[0], b.best_ask[0] = i, oi.ask0 * jb
+      end
+      if oi.sur1 > 0.05 and oi.ask1 * jb < b.best_ask[1] then
+        b.best[1], b.best_ask[1] = i, oi.ask1 * jb
+      end
+      if random() * nb < 1 then b.cand = i end
+      if oi.money > b.rich_m then
+        b.rich_m, b.rdx, b.rdy = oi.money, -dx, -dy
+      end
+      b.kdx, b.kdy, b.px, b.py = b.kdx - dx * kw, b.kdy - dy * kw, b.px + dx * pw, b.py + dy * pw
     end
   until at >= NC
 
   for s = 0, pop - 1 do
     local i = cell_items[s]
     local u, a = U[i], SC[i]
-    a.best[0] = a.best[0] >= 0 and cell_items[a.best[0]] or -1
-    a.best[1] = a.best[1] >= 0 and cell_items[a.best[1]] or -1
-    a.cand = a.cand >= 0 and cell_items[a.cand] or -1
     local g, cell = u.g, u.cell
     local cx = band(cell, GMASK)
     -- stubborn units never revise prices or go looking for something better; only separation moves them

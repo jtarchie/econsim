@@ -192,9 +192,9 @@ M-series laptop, LuaJIT 2.1, single-threaded, assertions off (`bench.lua`, best 
 
 | world | cap | steady-state pop | ms/tick | ticks/s | unit-ticks/s |
 |---|---|---|---|---|---|
-| 2048² (default) | 16,384 | ~2,000 | 1.6 | 620 | 1.36M |
-| 8192² | 262,144 | ~126,000 | 143 | 7.0 | 0.92M |
-| 16384² | 524,288 | ~276,000 | 285 | 3.5 | 0.91M |
+| 2048² (default) | 16,384 | ~2,000 | 1.4 | 729 | 1.64M |
+| 8192² | 262,144 | ~126,000 | 114 | 8.8 | 1.16M |
+| 16384² | 524,288 | ~276,000 | 236 | 4.2 | 1.04M |
 
 Cost per unit depends on how clustered the population is, not just its size: a freshly seeded
 16384² world ticks in ~40ms because everyone is spread thin, and slows as towns condense and each
@@ -205,10 +205,10 @@ luajit bench.lua --cap=524288 --grid=1024 --pop=200000 --ticks=25
 luajit main.lua  --cap=262144 --grid=512  --pop=100000     # watchable
 ```
 
-A continent runs, but it runs at a few ticks per second, not at 60. Roughly half of a tick is
-neighbour discovery — about twelve candidates per unit, of which a third are inside the interaction
-radius — and that half is memory-latency bound, not compute bound. The profiler reports ~94% of the
-tick executing compiled traces with no aborts, so there is no interpreter overhead left to reclaim.
+A continent runs, but it runs at a few ticks per second, not at 60. The largest single cost is
+still neighbour discovery, and it is memory-latency bound rather than compute bound: the profiler
+reports ~94% of the tick executing compiled traces with no aborts, so there is no interpreter
+overhead left to reclaim, and the wins have all come from moving bytes closer together.
 
 Things that were tried and **lost**, so they are not in the code:
 
@@ -218,6 +218,19 @@ Things that were tried and **lost**, so they are not in the code:
   loop is only ~7 iterations, and trace-entry overhead ate the saving.
 - Rejecting out-of-range candidates in the consumer instead of the producer. It moves the work, it
   does not remove it.
+- **Verlet lists** — caching the neighbour list across ticks with a skin radius, the standard trick
+  from molecular dynamics. Measured first: units drift 1.06 world units per tick on average and up
+  to 5 at the tail, against an interaction radius of 16. The fastest cover ~31% of the cutoff every
+  tick, so a conservative skin has to be about 10 — and a cached list of radius 26 covers π·26² =
+  2124 units² against the grid's 9·16² = 2304. The same size. You would pay an identical per-tick
+  distance test *plus* a periodic rebuild over a 5×5 block. Verlet pays in MD because particles move
+  ~1% of the cutoff per step; here it is 31%.
+- **R-trees or another spatial index.** A uniform grid with cell size = query radius is already O(1)
+  expected candidates via pure arithmetic; a tree adds an O(log n) descent of *dependent* pointer
+  loads, which is the exact access pattern everything above was built to avoid. It would also have
+  to be rebuilt every tick — bulk-loading is a sort, strictly worse than the O(n) counting sort the
+  grid uses. Trees earn their keep for extended objects, varying query radii, or disk-resident data;
+  these are points, one fixed radius, all in RAM.
 
 What would actually move the needle next is threads — the tick decomposes cleanly by cell — and
 LuaJIT has no shared-memory parallel loop. That is the argument for a C kernel, not the language.
