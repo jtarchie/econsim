@@ -19,16 +19,26 @@ local SEEK_RICH, SEEK_KIN, MIGRATE, REPRO, ENDOW, INHERIT, BORROW, BUILD = 9, 10
 local SPECULATE, PEDDLE, CRAFT = 17, 18, 19
 local FOOD, TOOLS = 0, 1
 
+-- signed and exhaustive, so a unit's channels sum to exactly its money: that is what makes "where did this fortune come from" answerable, and validate() checks it
+local NCHAN = 9
+local CH_FOUND, CH_SELL, CH_BUY, CH_CREDIT, CH_DEBT, CH_STAKE, CH_BEQUEST, CH_SCATTER, CH_DIVIDEND = 0, 1, 2, 3, 4, 5, 6, 7, 8
+
 ffi.cdef([[
 typedef struct {
   float x, y, vx, vy;
   double money, debt, lent;
   float stock[2], belief[2], ask[2], surplus[2], capital, hue;
-  uint32_t age, gen, heir_gen;
+  uint32_t age, gen, heir_gen, dyn;
   int32_t default_tick, cell, heir;
   uint8_t nloans, alive, sold[2], cr, cg, cb, stubborn;
   float g[20];
 } unit_t;
+/* cold biography, --track only: kept out of unit_t so the memory-bound tick never drags it through cache */
+typedef struct {
+  double chan[9];
+  float peak, cur, ppct;
+  int32_t born, kids;
+} trk_t;
 typedef struct {
   int32_t lender, borrower, expiry;
   uint32_t lgen, bgen;
@@ -69,6 +79,8 @@ local M = {
     "craft",
   },
   FLASH = { TRADE = 0, BIRTH = 1, DEATH = 2, DEFAULT = 3, LOAN = 4 },
+  CHANNELS = { "founding", "sales", "purchases", "credit", "debt", "children", "bequest", "estates", "dividend" },
+  CAUSES = { "starved", "aged" },
   knobs = {
     cap = 16384,
     grid = 128,
@@ -84,6 +96,9 @@ local M = {
     shock_every = 600,
     stubborn_founders = 0.2,
     stubborn_birth = 0.02,
+    track = 1,
+    lending = 1.0,
+    usury = 1.0,
   },
   KNOB_HELP = {
     cap = "unit slots, a power of two; the hard population ceiling",
@@ -100,6 +115,9 @@ local M = {
     shock_every = "mean ticks between crop failures, 0 = never",
     stubborn_founders = "fraction of founders who never adapt",
     stubborn_birth = "chance an adaptive unit's child is stubborn",
+    track = "1 to record per-unit money channels, rank history and death records; 0 costs nothing",
+    lending = "scales how often surplus money is offered as a loan; 0 is an economy with no credit",
+    usury = "hard ceiling on the interest rate a lender may charge",
   },
   shock = { x = 0, y = 0, r = 0, ttl = 0 },
   -- the unit the UI is following; compaction moves slots, so the sim owns this index
@@ -118,15 +136,27 @@ local proj = ffi.new("float[?]", NG * 2)
 local hist = ffi.new("float[?]", (4 + NG) * HN)
 M.hist = hist
 
-local ensure_size, check_static, reset_scratch
+local ensure_size, ensure_track, check_static, reset_scratch, update_ranks
 local nfree, nfree_loans, loan_hi, ndying, flash_head = 0, 0, 0, 0, 0
 local tick, commons, supply = 0, 0, 0
 local c_births, c_starved, c_aged, c_defaults, c_trades, c_volume, c_loans, c_spec, c_tool_vol = 0, 0, 0, 0, 0, 0, 0, 0, 0
+-- lifetime counters, as one table because init() is already at LuaJIT's 60-upvalue ceiling
+local TOT = { births = 0, starved = 0, aged = 0, defaults = 0, trades = 0, volume = 0 }
+-- biography arrays and the dynasty histogram; TR is nil unless --track is on, so every use is guarded by trk
+local TR, T2, TR_CAP, trk = nil, nil, 0, false
+local dcount, dworth, ndyn = nil, nil, 0
+-- the cause a unit is dying of, parallel to dying[]: known at kill(), needed at bury(), and never after
+local dying_why = nil
 
 local function flash(x, y, kind)
   local f = flashes[flash_head]
   f.x, f.y, f.kind, f.ttl = x, y, kind, 24
   flash_head = band(flash_head + 1, NFLASH - 1)
+end
+
+local function led(i, k, v)
+  local c = TR[i].chan
+  c[k] = c[k] + v
 end
 
 local function paint(u)
@@ -173,12 +203,18 @@ local function spawn(x, y)
   u.gen, u.x, u.y, u.alive, u.heir, u.default_tick = gen, x, y, 1, -1, -1000000
   u.belief[FOOD], u.belief[TOOLS] = 10, 20
   live[nlive], live_at[i], nlive = i, nlive, nlive + 1
+  -- slots are reused, so the previous occupant's biography must not bleed into this one
+  if trk then
+    ffi.fill(TR + i, ffi.sizeof("trk_t"))
+    TR[i].born, TR[i].ppct = tick, -1
+  end
   return i, u
 end
 
 function M.init(seed)
   M.check_knobs()
   ensure_size()
+  ensure_track()
   -- fixed seed: hue projection must match across runs so colors are comparable
   math.randomseed(1234)
   for k = 0, NG * 2 - 1 do
@@ -197,6 +233,9 @@ function M.init(seed)
   reset_scratch()
   flash_head, M.shock.x, M.shock.y, M.shock.r = 0, 0, 0, 0
   c_births, c_starved, c_aged, c_defaults, c_trades, c_volume, c_loans, c_spec, c_tool_vol = 0, 0, 0, 0, 0, 0, 0, 0, 0
+  TOT.births, TOT.starved, TOT.aged, TOT.defaults, TOT.trades, TOT.volume = 0, 0, 0, 0, 0, 0
+  if trk then ffi.fill(TR, CAP * ffi.sizeof("trk_t")) end
+  M.reset_deaths()
   nfree, nfree_loans = CAP, MAXLOANS
   for i = 0, CAP - 1 do
     free_units[i] = CAP - 1 - i
@@ -227,13 +266,16 @@ function M.init(seed)
   end
 
   local kn = M.knobs
-  for _ = 1, kn.pop do
+  for n = 1, kn.pop do
     local x, y
     local field = random() < kn.artisans and ore or fert
     repeat
       x, y = random() * W, random() * W
     until field[floor(y * INV_CELL) * GRID + floor(x * INV_CELL)] > 0.55
-    local _, u = spawn(x, y)
+    local i, u = spawn(x, y)
+    -- one dynasty per founder, carried down every descendant: lineage share is the metric selection actually optimises
+    u.dyn = n
+    if trk then TR[i].chan[0] = kn.money end
     for k = 0, NG - 1 do
       u.g[k] = random()
     end
@@ -292,15 +334,20 @@ end
 -- the gathers are sequential instead of jumping across a unit array far larger than cache.
 -- Slot identity is not economic state: the same units stay in the same visit order, so the
 -- trajectory is unchanged. Only the indices that name them move, and every reference is remapped.
-local UNIT_BYTES = ffi.sizeof("unit_t")
+local UNIT_BYTES, TRK_BYTES = ffi.sizeof("unit_t"), ffi.sizeof("trk_t")
 local function compact()
   ffi.fill(remap, CAP * 4, 0xFF)
   for s = 0, nlive - 1 do
     local i = cell_items[s]
     remap[i], nn2[s] = s, SC[i].nn
     ffi.copy(U2 + s, U + i, UNIT_BYTES)
+    if trk then ffi.copy(T2 + s, TR + i, TRK_BYTES) end
   end
   ffi.copy(U, U2, nlive * UNIT_BYTES)
+  if trk then
+    ffi.copy(TR, T2, nlive * TRK_BYTES)
+    ffi.fill(TR + nlive, (CAP - nlive) * TRK_BYTES)
+  end
   -- dead slots must read as never-used: validate() insists they hold no money
   ffi.fill(U + nlive, (CAP - nlive) * UNIT_BYTES)
   for s = 0, nlive - 1 do
@@ -322,9 +369,9 @@ local function compact()
   M.selected = M.selected >= 0 and remap[M.selected] or -1
 end
 
-local function kill(i, u)
+local function kill(i, u, why)
   u.alive = 2
-  dying[ndying] = i
+  dying[ndying], dying_why[ndying] = i, why
   ndying = ndying + 1
   flash(u.x, u.y, 2)
 end
@@ -369,7 +416,7 @@ ensure_size = function()
   L = ffi.new("loan_t[?]", MAXLOANS)
   flashes = ffi.new("flash_t[?]", NFLASH)
   free_units, free_loans = ffi.new("int32_t[?]", CAP), ffi.new("int32_t[?]", MAXLOANS)
-  dying, heirs = ffi.new("int32_t[?]", CAP), ffi.new("int32_t[?]", CAP)
+  dying, dying_why, heirs = ffi.new("int32_t[?]", CAP), ffi.new("uint8_t[?]", CAP), ffi.new("int32_t[?]", CAP)
   live, live_at = ffi.new("int32_t[?]", CAP), ffi.new("int32_t[?]", CAP)
   cell_start, cell_cursor = ffi.new("int32_t[?]", NC + 1), ffi.new("int32_t[?]", NC + 1)
   cell_items = ffi.new("int32_t[?]", CAP)
@@ -399,6 +446,19 @@ ensure_size = function()
   M.CAP, M.W, M.GRID, M.CELL, M.MAXLOANS = CAP, W, GRID, CELL, MAXLOANS
   M.units, M.loans, M.flashes, M.fert, M.ore = U, L, flashes, fert, ore
   check_static()
+end
+
+-- the biography arrays follow the track knob, which init() may flip without the world changing shape
+ensure_track = function()
+  trk = M.knobs.track == 1
+  if trk and TR_CAP ~= CAP then
+    TR, T2, TR_CAP = ffi.new("trk_t[?]", CAP), ffi.new("trk_t[?]", CAP), CAP
+  end
+  if ndyn ~= M.knobs.pop then
+    ndyn = M.knobs.pop
+    dcount, dworth = ffi.new("int32_t[?]", ndyn + 1), ffi.new("double[?]", ndyn + 1)
+  end
+  M.track = TR
 end
 
 -- scratch carries last tick's scan into produce(); stale values from a previous run made reseeded runs diverge
@@ -438,8 +498,8 @@ local function phase_produce(pop)
     u.stock[TOOLS] = u.stock[TOOLS] + TOOLRATE * labor * craft * ore[cell] / (0.5 + 0.5 * crowd)
     u.capital = u.capital * 0.997
     if u.stock[FOOD] < 0 then
-      c_starved = c_starved + 1
-      kill(i, u)
+      c_starved, TOT.starved = c_starved + 1, TOT.starved + 1
+      kill(i, u, 1)
     else
       -- would-be parents shop for the child's food stake, else landless artisans could never reproduce
       local broody = u.age > 300 and u.money - u.debt > 300 + 3000 * g[REPRO]
@@ -682,7 +742,12 @@ local function phase_trade(pop, start, stride, k)
         s.belief[k] = s.belief[k] * (1.01 - 0.01 * s.stubborn)
         s.stock[k], s.surplus[k], s.money, s.sold[k] = s.stock[k] - qty, s.surplus[k] - qty, s.money + cost, 1
         u.stock[k], u.surplus[k], u.money = u.stock[k] + qty, u.surplus[k] + qty, u.money - cost
+        if trk then
+          led(best, CH_SELL, cost)
+          led(i, CH_BUY, -cost)
+        end
         c_trades, c_volume = c_trades + 1, c_volume + cost
+        TOT.trades, TOT.volume = TOT.trades + 1, TOT.volume + cost
         c_tool_vol = c_tool_vol + cost * k
         if want then
           u.belief[k] = u.belief[k] + (ask - u.belief[k]) * 0.3 * (1 - u.stubborn)
@@ -706,6 +771,7 @@ end
 
 local function phase_lend(pop, start, stride)
   local at = start % pop
+  local offer, cap_rate = 0.05 * M.knobs.lending, M.knobs.usury
   stride = stride % pop
   for _ = 0, pop - 1 do
     local i = cell_items[at]
@@ -713,11 +779,11 @@ local function phase_lend(pop, start, stride)
     if at >= pop then at = at - pop end
     local u = U[i]
     local g, cand = u.g, SC[i].cand
-    if u.alive == 1 and cand >= 0 and u.nloans < 4 and nfree_loans > 0 and random() < g[INVEST] * 0.05 then
+    if u.alive == 1 and cand >= 0 and u.nloans < 4 and nfree_loans > 0 and random() < g[INVEST] * offer then
       local spare = u.money - u.belief[FOOD] * upkeep_of(g) * (20 + 200 * g[RESERVE])
       local amount = floor(spare * (0.1 + 0.4 * g[INVEST]))
       local o = U[cand]
-      local rate = 0.05 + 0.5 * g[GREED]
+      local rate = min(cap_rate, 0.05 + 0.5 * g[GREED])
       if amount >= 50 and o.alive == 1 and o.debt / (o.money + 1) < 0.2 + 3 * g[RISK] and tick - o.default_tick > 4000 * (1 - g[RISK]) and rate <= 0.05 + 0.6 * o.g[BORROW] and o.debt < 5000 * o.g[BORROW] then
         nfree_loans = nfree_loans - 1
         local li = free_loans[nfree_loans]
@@ -728,6 +794,10 @@ local function phase_lend(pop, start, stride)
         l.owed, l.installment, l.expiry, l.active = owed, ceil(owed / TERM), tick + TERM * 2, 1
         u.money, u.lent, u.nloans = u.money - amount, u.lent + owed, u.nloans + 1
         o.money, o.debt = o.money + amount, o.debt + owed
+        if trk then
+          led(i, CH_CREDIT, -amount)
+          led(cand, CH_DEBT, amount)
+        end
         c_loans = c_loans + 1
         flash(o.x, o.y, 4)
       end
@@ -752,8 +822,8 @@ local function phase_move(pop)
       if u.y >= W then u.y = 0 end
       u.age = u.age + 1
       if u.age > 3000 and random() < 0.002 then
-        c_aged = c_aged + 1
-        kill(i, u)
+        c_aged, TOT.aged = c_aged + 1, TOT.aged + 1
+        kill(i, u, 2)
       end
     end
   end
@@ -793,15 +863,21 @@ local function phase_birth(pop)
         if random() < 0.03 then c.g[CRAFT] = 1 - c.g[CRAFT] end
         c.stubborn = random() < M.knobs.stubborn_birth and 1 or 0
       end
-      c.money, c.capital, c.cell = floor(u.money * frac), u.capital * frac, at
+      c.money, c.capital, c.cell, c.dyn = floor(u.money * frac), u.capital * frac, at, u.dyn
       u.money, u.capital = u.money - c.money, u.capital - c.capital
+      if trk then
+        led(ci, CH_FOUND, c.money)
+        led(i, CH_STAKE, -c.money)
+        -- the rank the child is born into, kept for the mobility table it will land in when it dies
+        TR[ci].ppct, TR[i].kids = TR[i].cur, TR[i].kids + 1
+      end
       -- fixed food stake paid from surplus: births limited by food, not by infants starving
       c.stock[FOOD], c.stock[TOOLS], c.belief[FOOD], c.belief[TOOLS] = 60, u.stock[TOOLS] * frac, u.belief[FOOD], u.belief[TOOLS]
       u.stock[FOOD], u.stock[TOOLS] = u.stock[FOOD] - 60, u.stock[TOOLS] - c.stock[TOOLS]
       u.surplus[FOOD], u.surplus[TOOLS] = u.surplus[FOOD] - 60, min(u.surplus[TOOLS], u.stock[TOOLS])
       u.heir, u.heir_gen = ci, c.gen
       paint(c)
-      c_births = c_births + 1
+      c_births, TOT.births = c_births + 1, TOT.births + 1
       flash(c.x, c.y, 1)
     end
   end
@@ -840,11 +916,15 @@ local function step_loans()
         end
         b.money, le.money = b.money - pay, le.money + pay
         b.debt, le.lent, l.owed = b.debt - pay, le.lent - pay, l.owed - pay
+        if trk and pay ~= 0 then
+          led(l.borrower, CH_DEBT, -pay)
+          led(l.lender, CH_CREDIT, pay)
+        end
         if l.owed <= 0 then
           close_loan(li, l, le)
         elseif b.alive == 2 or tick > l.expiry then
           b.debt, b.default_tick = b.debt - l.owed, tick
-          c_defaults = c_defaults + 1
+          c_defaults, TOT.defaults = c_defaults + 1, TOT.defaults + 1
           flash(le.x, le.y, 3)
           close_loan(li, l, le)
         end
@@ -853,10 +933,63 @@ local function step_loans()
   end
 end
 
+-- wealth rank in fifths; 1 is the poorest fifth of the living at the last compute_stats()
+local function quint(p) return max(1, min(5, floor(p * 5) + 1)) end
+
+-- lifetime aggregates over everyone who has died: the only place a whole life can be summarised
+function M.reset_deaths()
+  local d = { n = 0, founders = 0, cause = { 0, 0 }, mob = {}, q = {} }
+  for p = 1, 5 do
+    d.mob[p] = { 0, 0, 0, 0, 0 }
+  end
+  for q = 1, 5 do
+    local chan = {}
+    for c = 1, NCHAN do
+      chan[c] = 0
+    end
+    d.q[q] = { n = 0, age = 0, kids = 0, chan = chan }
+  end
+  M.deaths = d
+end
+
+-- one row per death, for whatever you want to plot; the in-memory aggregates above answer most of it
+function M.open_death_log(path)
+  local f = assert(io.open(path, "w"))
+  f:write("tick,born,age,dynasty,cause,parent_pct,peak_pct,kids,money")
+  for _, name in ipairs(M.CHANNELS) do
+    f:write(",", name)
+  end
+  f:write("\n")
+  M.death_log = f
+  return f
+end
+
+local DEATH_ROW = "%d,%d,%d,%d,%s,%.4f,%.4f,%d,%.0f," .. ("%.0f,"):rep(NCHAN - 1) .. "%.0f\n"
+
+local function record_death(i, u, why)
+  local t, d = TR[i], M.deaths
+  local q = quint(t.peak)
+  local row = d.q[q]
+  d.n, d.cause[why] = d.n + 1, d.cause[why] + 1
+  row.n, row.age, row.kids = row.n + 1, row.age + u.age, row.kids + t.kids
+  for c = 1, NCHAN do
+    row.chan[c] = row.chan[c] + t.chan[c - 1]
+  end
+  if t.ppct >= 0 then
+    local p = quint(t.ppct)
+    d.mob[p][q] = d.mob[p][q] + 1
+  else
+    d.founders = d.founders + 1
+  end
+  local f = M.death_log
+  if f then f:write(DEATH_ROW:format(tick, t.born, u.age, u.dyn, M.CAUSES[why], t.ppct, t.peak, t.kids, u.money, t.chan[0], t.chan[1], t.chan[2], t.chan[3], t.chan[4], t.chan[5], t.chan[6], t.chan[7], t.chan[8])) end
+end
+
 local function bury()
   for k = 0, ndying - 1 do
     local i = dying[k]
     local u = U[i]
+    if trk then record_death(i, u, dying_why[k]) end
     local estate = u.money
     local tax = floor(estate * M.knobs.estate_tax)
     commons, estate = commons + tax, estate - tax
@@ -864,6 +997,7 @@ local function bury()
     if h >= 0 and U[h].alive == 1 and U[h].gen == u.heir_gen then
       local part = floor(estate * u.g[INHERIT])
       U[h].money, estate = U[h].money + part, estate - part
+      if trk then led(h, CH_BEQUEST, part) end
     end
     local cx, cy, nn = band(u.cell, GMASK), floor(u.cell / GRID), 0
     for n = 0, 8 do
@@ -877,8 +1011,14 @@ local function bury()
     for t = 0, nn - 1 do
       U[heirs[t]].money = U[heirs[t]].money + share
     end
+    if trk and share ~= 0 then
+      for t = 0, nn - 1 do
+        led(heirs[t], CH_SCATTER, share)
+      end
+    end
     estate = estate - share * nn
     commons = commons + estate
+    if trk then ffi.fill(TR + i, TRK_BYTES) end
     u.money, u.alive, u.gen = 0, 0, u.gen + 1
     free_units[nfree] = i
     nfree = nfree + 1
@@ -938,9 +1078,30 @@ function M.tick()
         local u = U[live[s]]
         u.money = u.money + per
       end
+      if trk then
+        for s = 0, nlive - 1 do
+          led(live[s], CH_DIVIDEND, per)
+        end
+      end
       commons = commons - per * alive
     end
   end
+  if trk and (tick % 30 == 0 or tick == 1) then update_ranks() end
+end
+
+-- every debt forgiven where it stands. No money moves, so the supply is untouched; the lenders simply never see it again
+function M.jubilee()
+  local n = 0
+  for li = 0, loan_hi - 1 do
+    local l = L[li]
+    if l.active == 1 then
+      local le = U[l.lender]
+      U[l.borrower].debt = U[l.borrower].debt - l.owed
+      close_loan(li, l, le)
+      n = n + 1
+    end
+  end
+  return n
 end
 
 function M.trigger_shock(x, y)
@@ -968,6 +1129,7 @@ end
 -- so the small worlds this started as still report exact figures.
 local SAMPLE = 16384
 local sw, sp, st = ffi.new("double[?]", SAMPLE), ffi.new("double[?]", SAMPLE), ffi.new("double[?]", SAMPLE)
+local rw = ffi.new("double[?]", SAMPLE)
 local gsum = ffi.new("double[?]", NG)
 local LOG10 = log(10)
 
@@ -1022,6 +1184,57 @@ local function sortd(a, lo, hi)
   insertion(a, lo, hi)
 end
 
+-- sampled by the tick, not by the host: an unsampled peak rank reads as zero rather than as missing, which would turn the mobility table into fiction
+update_ranks = function()
+  local s = M.stats
+  local pf, pt = s.price or 10, s.tool_price or 20
+  local stride = max(1, ceil(nlive / SAMPLE))
+  local m, n = 0, 0
+  for k = 0, nlive - 1 do
+    local u = U[live[k]]
+    if u.alive == 1 then
+      if n % stride == 0 and m < SAMPLE then
+        rw[m] = max(0, u.money + u.lent - u.debt + u.stock[0] * pf + (u.stock[1] + u.capital) * pt)
+        m = m + 1
+      end
+      n = n + 1
+    end
+  end
+  if m == 0 then return end
+  sortd(rw, 0, m - 1)
+  local inv = 0.5 / m
+  for k = 0, nlive - 1 do
+    local i = live[k]
+    local u = U[i]
+    if u.alive == 1 then
+      local w = max(0, u.money + u.lent - u.debt + u.stock[0] * pf + (u.stock[1] + u.capital) * pt)
+      local lo, hi = 0, m
+      while lo < hi do
+        local mid = floor((lo + hi) / 2)
+        if rw[mid] < w then
+          lo = mid + 1
+        else
+          hi = mid
+        end
+      end
+      local lo2 = lo
+      hi = m
+      while lo2 < hi do
+        local mid = floor((lo2 + hi) / 2)
+        if rw[mid] <= w then
+          lo2 = mid + 1
+        else
+          hi = mid
+        end
+      end
+      -- the tie block's midpoint: a field of equals must rank in the middle, not all at the top
+      local t = TR[i]
+      t.cur = (lo + lo2) * inv
+      if t.cur > t.peak then t.peak = t.cur end
+    end
+  end
+end
+
 function M.compute_stats()
   local s = M.stats
   local n, debt, artisans, capital, stubborn = 0, 0, 0, 0, 0
@@ -1034,6 +1247,8 @@ function M.compute_stats()
   local pf, pt = s.price or 10, s.tool_price or 20
   local stride = max(1, ceil(nlive / SAMPLE))
   local m = 0
+  ffi.fill(dcount, (ndyn + 1) * 4)
+  ffi.fill(dworth, (ndyn + 1) * 8)
   for k = 0, nlive - 1 do
     local u = U[live[k]]
     if u.alive == 1 then
@@ -1042,6 +1257,8 @@ function M.compute_stats()
         sw[m], sp[m], st[m] = w, u.belief[FOOD], u.belief[TOOLS]
         m = m + 1
       end
+      local dy = u.dyn
+      dcount[dy], dworth[dy] = dcount[dy] + 1, dworth[dy] + w
       n = n + 1
       capital = capital + u.capital
       if u.g[CRAFT] > 0.5 then artisans = artisans + 1 end
@@ -1077,6 +1294,20 @@ function M.compute_stats()
   end
   s.top1 = total > 0 and top / total or 0
 
+  -- how much of the map one founding line now holds: what selection is actually maximising, unlike money
+  local lines, big, bigw, allw = 0, 0, 0, 0
+  for d = 1, ndyn do
+    local c = dcount[d]
+    allw = allw + dworth[d]
+    if c > 0 then
+      lines = lines + 1
+      if c > big then
+        big, bigw = c, dworth[d]
+      end
+    end
+  end
+  s.lines, s.top_line, s.top_line_worth = lines, n > 0 and big / n or 0, allw > 0 and bigw / allw or 0
+
   local means = s.means or {}
   for k = 1, NG do
     means[k] = n > 0 and gsum[k - 1] / n or 0
@@ -1084,6 +1315,8 @@ function M.compute_stats()
   s.pop, s.debt, s.means, s.tick, s.commons = n, debt, means, tick, commons
   s.nloans = MAXLOANS - nfree_loans
   s.births, s.starved, s.aged, s.defaults = c_births, c_starved, c_aged, c_defaults
+  -- the per-30-tick counters above are zeroed here, so anything comparing whole runs needs these
+  s.tot_births, s.tot_starved, s.tot_aged, s.tot_defaults, s.tot_trades, s.tot_volume = TOT.births, TOT.starved, TOT.aged, TOT.defaults, TOT.trades, TOT.volume
   s.trades, s.volume, s.new_loans, s.spec, s.tool_volume = c_trades, c_volume, c_loans, c_spec, c_tool_vol
   c_spec, c_tool_vol = 0, 0
   s.unmet = s.unmet or {}
@@ -1101,9 +1334,15 @@ function M.compute_stats()
 end
 
 function M.loan_hi() return loan_hi end
+function M.tick_count() return tick end
 
 -- renderer walks these instead of all CAP slots
 function M.live_set() return live, nlive end
+
+-- the biography of one slot, or nil when --track is off
+function M.bio(i) return trk and i >= 0 and TR[i] or nil end
+function M.tracking() return trk end
+function M.NCHAN() return NCHAN end
 
 ---------------------------------------------------------------------------------------------------
 -- Assertions. Static ones run at load; state ones run per phase when M.debug, and in M.selftest().
@@ -1157,6 +1396,9 @@ function M.check_knobs()
   check(k.shock_every >= 0, "knob shock_every=%g negative", k.shock_every)
   check(k.stubborn_founders >= 0 and k.stubborn_founders <= 1, "knob stubborn_founders=%g outside [0,1]", k.stubborn_founders)
   check(k.stubborn_birth >= 0 and k.stubborn_birth <= 1, "knob stubborn_birth=%g outside [0,1]", k.stubborn_birth)
+  check(k.track == 0 or k.track == 1, "knob track=%g must be 0 or 1", k.track)
+  check(k.lending >= 0 and k.lending <= 1, "knob lending=%g outside [0,1]", k.lending)
+  check(k.usury > 0, "knob usury=%g must be positive", k.usury)
 end
 
 function M.totals()
@@ -1258,6 +1500,11 @@ function M.validate()
     check(u.alive <= 1, "unit %d alive=%d between ticks", i, u.alive)
     if u.alive == 0 then
       check(u.money == 0, "dead slot %d still holds %.0f money", i, u.money)
+      if trk then
+        for c = 0, NCHAN - 1 do
+          check(TR[i].chan[c] == 0, "dead slot %d still carries %s %.0f", i, M.CHANNELS[c + 1], TR[i].chan[c])
+        end
+      end
     else
       alive, money = alive + 1, money + u.money
       check(finite(u.x) and finite(u.y) and u.x >= 0 and u.x < W and u.y >= 0 and u.y < W, "unit %d off the map (%g,%g)", i, u.x, u.y)
@@ -1272,6 +1519,18 @@ function M.validate()
       check(u.hue >= 0 and u.hue < 360.001, "unit %d hue=%g", i, u.hue)
       check(u.age < 1e6, "unit %d age=%d", i, u.age)
       check(u.heir >= -1 and u.heir < CAP and u.heir ~= i, "unit %d heir=%d", i, u.heir)
+      check(u.dyn >= 1 and u.dyn <= ndyn, "unit %d dynasty=%d outside 1..%d founders", i, u.dyn, ndyn)
+      if trk then
+        local t, sum = TR[i], 0
+        for c = 0, NCHAN - 1 do
+          check(finite(t.chan[c]) and whole(t.chan[c]), "unit %d channel %s=%g must be a whole number", i, M.CHANNELS[c + 1], t.chan[c])
+          sum = sum + t.chan[c]
+        end
+        -- exhaustive by construction: any transfer that forgot its ledger entry shows up here
+        check(sum == u.money, "unit %d holds %.0f but its channels account for %.0f", i, u.money, sum)
+        check(t.peak >= 0 and t.peak <= 1 and t.cur >= 0 and t.cur <= 1 and t.peak >= t.cur - 1e-6, "unit %d rank cur=%g peak=%g", i, t.cur, t.peak)
+        check(t.ppct >= -1 and t.ppct <= 1 and t.born >= 0 and t.born <= tick and t.kids >= 0, "unit %d biography (parent %g, born %d, kids %d)", i, t.ppct, t.born, t.kids)
+      end
       for k = 0, 1 do
         check(finite(u.stock[k]) and u.stock[k] >= -1e-3, "unit %d stock[%d]=%g", i, k, u.stock[k])
         check(finite(u.belief[k]) and u.belief[k] >= 0.049, "unit %d belief[%d]=%g", i, k, u.belief[k])
@@ -1336,6 +1595,11 @@ function M.validate()
   check(s.pop == alive, "stats pop %d ~= %d alive", s.pop, alive)
   check(s.gini >= -1e-9 and s.gini <= 1 and s.top1 >= 0 and s.top1 <= 1 + 1e-9, "gini=%g top1=%g", s.gini, s.top1)
   check(s.artisans <= s.pop and s.stubborn <= s.pop, "artisans/stubborn exceed pop")
+  check(s.lines >= (alive > 0 and 1 or 0) and s.lines <= min(alive, ndyn), "%d surviving lines among %d units", s.lines, alive)
+  check(s.top_line >= 0 and s.top_line <= 1 + 1e-9 and s.top_line_worth >= 0 and s.top_line_worth <= 1 + 1e-9, "line shares %g / %g", s.top_line, s.top_line_worth)
+  local d = M.deaths
+  check(d.n == d.cause[1] + d.cause[2], "%d deaths recorded, %d by cause", d.n, d.cause[1] + d.cause[2])
+  check(not trk or d.n == TOT.starved + TOT.aged, "%d deaths recorded, %d units died", d.n, TOT.starved + TOT.aged)
   local bins = 0
   for b = 1, 24 do
     bins = bins + s.wealth_bins[b]
@@ -1351,6 +1615,18 @@ local DEFAULTS = {}
 for k, v in pairs(M.knobs) do
   DEFAULTS[k] = v
 end
+
+-- a fresh copy, so a runner sweeping several configurations in one process can get back to zero
+function M.defaults()
+  local out = {}
+  for k, v in pairs(DEFAULTS) do
+    out[k] = v
+  end
+  return out
+end
+
+-- knobs the command line set explicitly, so a scenario can be overridden from the shell but not silently
+M.knobs_set = {}
 
 local function fingerprint()
   local h = commons + tick
@@ -1427,21 +1703,26 @@ function M.parse_args(argv, extras)
     if key == "help" or not key or (M.knobs[key] == nil and extras[key] == nil) then
       io.stderr:write(key == "help" and "" or ("unknown argument: " .. a .. "\n"), "options (--name=value):\n")
       for _, n in ipairs(names) do
-        local flag = n:gsub("_", "-")
-        io.stderr:write(("  --%-18s %s%s\n"):format(flag, M.KNOB_HELP[n] or extras[n], DEFAULTS[n] and (" (default %s)"):format(DEFAULTS[n]) or ""))
+        local flag, h = n:gsub("_", "-"), M.KNOB_HELP[n] or extras[n]
+        io.stderr:write(("  --%-18s %s%s\n"):format(flag, type(h) == "table" and h[1] or h, DEFAULTS[n] and (" (default %s)"):format(DEFAULTS[n]) or ""))
       end
       os.exit(key == "help" and 0 or 2)
     end
-    local num = tonumber(val)
-    if val == "" then num = 1 end
-    if not num then
-      io.stderr:write(("--%s needs a number, got '%s'\n"):format(key, val))
-      os.exit(2)
-    end
-    if M.knobs[key] ~= nil then
-      M.knobs[key] = num
+    -- an extra declared as a table takes text; everything else must be a number, silently-ignored typos being the worse failure
+    if type(extras[key]) == "table" then
+      out[key] = val
     else
-      out[key] = num
+      local num = tonumber(val)
+      if val == "" then num = 1 end
+      if not num then
+        io.stderr:write(("--%s needs a number, got '%s'\n"):format(key, val))
+        os.exit(2)
+      end
+      if M.knobs[key] ~= nil then
+        M.knobs[key], M.knobs_set[key] = num, true
+      else
+        out[key] = num
+      end
     end
   end
   local ok, err = pcall(M.check_knobs)

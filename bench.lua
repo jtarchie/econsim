@@ -9,6 +9,8 @@ local opt = sim.parse_args(arg, {
 })
 local ticks, warm, passes = opt.ticks or 200, opt.warm or 100, opt.passes or 3
 sim.debug = false
+-- biography off unless asked for: this harness measures the tick, and --track is a reporting feature
+if not sim.knobs_set.track then sim.knobs.track = 0 end
 sim.init(opt.seed or 1)
 for _ = 1, warm do
   sim.tick()

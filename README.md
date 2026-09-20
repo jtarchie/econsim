@@ -5,11 +5,15 @@ broke, inherit and breed on a wrap-around world, and every behaviour they have i
 genome that mutates at birth. Nobody is told how to act — prices, towns, trade routes, credit
 bubbles and inequality are what is left after the selection pressure runs for a few thousand ticks.
 
+Every coin is tagged with where it came from, so the simulation can answer the question it exists to
+ask: **how does someone win at capitalism, and how does someone lose?** Run a scenario over a dozen
+seeds and it will tell you, with confidence intervals — see [Asking a question](#asking-a-question).
+
 The world is sized at startup. The default is 2,000 units on 2048×2048; `--cap`/`--grid` scale that
 to a continent — a quarter of a million units on 16384×16384 has been run to steady state with every
 invariant intact. See [Scale](#scale).
 
-LuaJIT + raylib, ~1,600 lines, no dependencies beyond the raylib shared library.
+LuaJIT + raylib, ~2,800 lines, no dependencies beyond the raylib shared library.
 
 ![mature economy](docs/03-mature.png)
 
@@ -18,6 +22,7 @@ LuaJIT + raylib, ~1,600 lines, no dependencies beyond the raylib shared library.
 ```sh
 brew install luajit raylib     # macOS; any LuaJIT 2.1 + raylib 5/6 works
 luajit main.lua                # opens the window
+luajit run.lua --scenario=scenarios/credit.lua   # headless: an experiment, with statistics
 luajit check.lua               # headless: 5000 ticks, asserts every invariant, prints ticks/sec
 luajit bench.lua               # headless throughput, best of N passes, no assertions
 ```
@@ -38,6 +43,15 @@ deliberately exaggerated so a 10× fortune is impossible to miss. Squares are th
 frozen genome, frozen price beliefs, no drives. They are the control group, and the fact that they
 are still ~40% of the population at tick 3,000 is the point: adaptation buys less than you would think.
 
+**`C` cycles what the colour means.** The genome projection above is one of four views:
+
+| View | Colour |
+|---|---|
+| `genome` | the fixed hue projection — similar colours are similar strategies |
+| `wealth rank` | blue is the poorest of the living, red the richest |
+| `dynasty` | one colour per founding line; a colour spreading is a lineage winning |
+| `income source` | the channel this unit has taken the most money from, so far, in its life |
+
 **Lines are loans**, drawn from lender to borrower, brightness in proportion to the amount owed.
 **Flashes** mark events: white = trade, green = birth, red = death, orange = default, blue = a loan
 written. A translucent red disc is a crop failure (a regional shock), which is the only way food is
@@ -52,12 +66,19 @@ destroyed other than eating and spoilage.
 | `gini / top 1% owns` | inequality. Gini is 0 when everyone is equal, 1 when one person owns everything |
 | `food / tools / capital` | median transaction prices, and mean installed capital per head |
 | `per 30t:` | births, starvations, old-age deaths and loan defaults in the last 30 ticks |
+| `lines` | founding lines with anyone left alive, and what the largest one owns |
 | sparklines | population, Gini, food price and tool price over the last 240 samples |
 | wealth distribution | histogram of net worth in log₁₀ buckets — watch the right tail grow |
 | gene means | population-average of each gene (bar) and its history (line) |
 
-Click anyone to open the inspector on the right: their money, stock, debts, price beliefs and full
-genome.
+Click anyone to open the inspector on the right: their money, stock, debts, price beliefs, full
+genome, the rank they were born into against the rank they hold now — and **where their money came
+from**, one bar per channel, right for money taken in and left for money paid out.
+
+`M` opens the mobility table: of everyone who has died, the fraction born into each fifth of the
+wealth order that ever reached each fifth. It is the plainest statement of how much birth decides.
+
+![mobility and income](docs/07-mobility.png)
 
 ## The states to watch for
 
@@ -126,13 +147,89 @@ Inside the red disc, fertility drops to 15% for as long as the shock lasts. Red 
 inside it, starvations and defaults tick up, and the survivors walk out along the food-supply
 gradient. Press `S` to drop one wherever the mouse is; `--shock-every=0` turns them off entirely.
 
+## Asking a question
+
+A scenario is a Lua table: knobs, a set of arms to compare, and events that fire on an exact tick.
+`scenarios/credit.lua` in full:
+
+```lua
+return {
+  name = "credit",
+  about = "Ablate lending. If fortunes are built on interest, an economy with no credit should ...",
+  ticks = 4000,
+  arms = {
+    { name = "credit" },
+    { name = "no-credit", knobs = { lending = 0 } },
+    { name = "rate-capped", knobs = { usury = 0.08 } },
+  },
+  events = {
+    { at = 1, arm = "no-credit", say = "no credit in this world: surplus money sits idle" },
+    { at = 2500, say = "compare the credit and debt rows of the death table" },
+  },
+}
+```
+
+Events carry `set` (change a knob), `shock` (a crop failure), `jubilee` (forgive every debt where it
+stands) and `say` (a caption on screen). The same file plays out in the window or runs headless:
+
+```sh
+luajit main.lua --scenario=scenarios/credit.lua --arm=no-credit   # watch one arm, with captions
+luajit run.lua  --scenario=scenarios/credit.lua --seeds=8         # run every arm, 8 seeds each
+make credit SEEDS=20                                              # same, one target per scenario
+```
+
+![a scenario playing](docs/08-scenario.png)
+
+**Every arm sees the same seeds**, so `run.lua` reports the *paired* difference — the same world
+twice, one knob apart — which is far tighter than comparing two independent means. A single run
+proves nothing here: the trajectory is chaotic, and any intervention shifts the random stream.
+
+```
+metric                    credit         no-credit       rate-capped
+gini                0.3477 +-0.0093     0.2995 +-0.0148     0.3294 +-0.00919
+
+paired difference vs 'credit' (same seed both sides; * = 95% CI excludes zero)
+gini              -0.04821 +-0.0182*    -0.01835 +-0.0181*
+top1              -0.01211 +-0.00648*   -0.007999 +-0.00591*
+tot_volume        -5.264e+05 +-2.6e+06   -1.338e+06 +-2.01e+06
+```
+
+Then, per arm, every life that ended: the mobility table, and the mean lifetime money flow by
+channel for each fifth of the wealth order.
+
+`--csv=` writes one row per run, `--deaths=` one row per death (birth tick, lifespan, dynasty, cause,
+rank born into, best rank reached, children, and all nine channels), for whatever you want to plot.
+
+### What it says so far
+
+Three things fall out of the tables above, on the default world at 4,000 ticks, 8 seeds:
+
+- **Lending is how you win.** Net lifetime profit from credit, by the best fifth a unit ever reached:
+  `-7, -15, -36, -27, +35`. Only the top fifth makes money on credit; everyone else pays for it.
+  Abolish lending and Gini drops 0.048 ± 0.018 and the top 1% share falls by a quarter — with **no
+  measurable cost to output**. Median worth, installed capital and trade volume are all null.
+  Credit in this model moves money upward without financing anything.
+- **Capping the interest rate at 8% gets a third of that effect** and leaves more loans outstanding
+  (2,255 against 1,564) — cheap credit is credit more borrowers accept.
+- **The largest inflow to the rich is other people's deaths.** By quintile, money received from the
+  estates of dead neighbours runs `123, 328, 551, 799, 1478`, an order of magnitude above named
+  inheritance (`11 … 113`). Estates scatter to whoever is standing nearby, and the rich stand in
+  crowded towns. Inequality here is substantially a geography of who is near a funeral.
+- **Birth decides most of it.** 75% of those born into the poorest fifth never leave it; 31% of those
+  born into the richest fifth die there, against 4% of the poorest who ever reach it.
+
+Each of those is a claim the code will now argue with you about, which is the point.
+
 ## Controls
 
 | Key | Action |
 | --- | --- |
 | `space` | pause |
 | `-` / `=` | halve / double ticks per frame |
+| `C` | cycle the colour view (genome / wealth rank / dynasty / income source) |
+| `M` | mobility table |
 | `S` | crop failure at the mouse |
+| `J` | jubilee: forgive every outstanding debt |
 | `R` | reset with the next seed |
 | `L` / `F` | toggle loan links / event flashes |
 | `H` | hide the panels |
@@ -148,8 +245,15 @@ Both binaries take the same world knobs; `--help` prints them with defaults.
 ```
 --cap --grid --cell --compact-every                      world size and memory layout
 --pop --money --artisans --yield --toolrate --mut        economy
---estate-tax --shock-every --stubborn-founders --stubborn-birth
+--estate-tax --lending --usury --shock-every             policy
+--stubborn-founders --stubborn-birth --track
 ```
+
+`--lending` scales how often surplus money is offered as a loan (`0` is an economy with no credit)
+and `--usury` caps the interest rate; both are the levers the `credit` scenario pulls. `--track=0`
+turns off the per-unit ledger, rank history and death records — it costs 96 bytes per unit slot and
+about 1.5% of the tick at the default size, 4% at 130k units, and without it the inspector's channel
+bars, the mobility table and the death tables are all empty.
 
 `--cap` is the hard population ceiling (a power of two), `--grid` the cells per side (a power of
 two), `--cell` the cell size in world units — which is also the interaction radius. The world is
@@ -157,8 +261,10 @@ two), `--cell` the cell size in world units — which is also the interaction ra
 `init()`, so memory is fixed from the moment it returns: about 750 bytes per unit slot plus 40
 bytes per cell — 427MB measured for `--cap=524288 --grid=1024`.
 
-`main.lua` adds `--seed --speed --shot --width --height --zoom --pick --no-selftest`.
-`check.lua` adds `--ticks --seed --fast`. `bench.lua` adds `--ticks --warm --passes --seed`.
+`main.lua` adds `--seed --speed --shot --width --height --zoom --pick --view --mob --scenario --arm
+--no-selftest`. `check.lua` adds `--ticks --seed --fast`. `bench.lua` adds `--ticks --warm --passes
+--seed` and defaults `--track=0`, since it measures the tick rather than the reporting.
+`run.lua` adds `--scenario --arm --seeds --seed0 --ticks --csv --deaths --quiet`.
 Unknown flags, non-numbers and out-of-range values exit 2.
 
 ## How a tick works
@@ -184,6 +290,14 @@ Unknown flags, non-numbers and out-of-range values exit 2.
 **Money is closed and exact.** It is stored as integer-valued doubles and every transfer is floored,
 so `sum(money) + sum(escrow)` is the same number on tick 1 and tick 100,000. Only food and tools are
 created and destroyed. That invariant is what `check.lua` exists to defend.
+
+**Every transfer is also tagged.** With `--track` on, each unit carries nine signed counters — one
+per way money can reach it or leave it — and they are exhaustive by construction, so a unit's
+channels sum to *exactly* the money it holds. `validate()` checks that equality for every unit, which
+means a transfer that forgot to record itself is a hard failure rather than a quietly wrong table.
+Seven of the nine are gross flows; `credit` and `debt` are netted within themselves, so `credit` is
+lifetime profit from lending and `debt` is the lifetime cost of borrowing (positive if you defaulted
+and kept it).
 
 ## Scale
 
@@ -267,6 +381,8 @@ make ci       # fmt-check + lint + check
 make bench    # throughput, default world
 make bench-big # throughput, 16384x16384 continent
 make shots    # regenerate docs/*.png
+make scenarios # every scenario, 8 seeds per arm
+make credit SEEDS=20   # one scenario; there is a target per scenarios/*.lua
 ```
 
 Formatting is [StyLua](https://github.com/JohnnyMorganz/StyLua) with `.stylua.toml`
@@ -281,7 +397,7 @@ The simulation asserts aggressively, in four tiers, so a production run pays for
 |---|---|---|
 | static checks on constants and struct layout | once per `init()` | free |
 | per-phase conservation checks | only when `sim.debug` is true | 1.1× |
-| `sim.validate()` — every unit, loan and free-list reconciled against the ledger | only when called | O(cap) |
+| `sim.validate()` — every unit, loan, free-list and money channel reconciled | only when called | O(cap) |
 | `sim.selftest()` — same seed twice, fingerprints compared | `main.lua` startup unless `--no-selftest` | fixed, always on the default small world |
 
 There are no assertions inside any per-unit loop; the `if dbg then` branches sit once per phase.

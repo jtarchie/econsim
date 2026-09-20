@@ -131,6 +131,37 @@ Camera2D pan/zoom.
 - **Stale loan refs** after slot reuse: `(idx, gen)` pairs.
 - **Float drift in money**: avoided by integer-valued doubles.
 
+## Status (2026-09-20) — measurement layer
+
+The sim could show that inequality happens but not say why anyone ended up where they did. Fixed by
+recording, not by modelling:
+
+- **Money channels.** Nine signed per-unit counters (`founding sales purchases credit debt children
+  bequest estates dividend`), exhaustive by construction, so `sum(channels) == money` exactly for
+  every unit. `validate()` asserts it, which is what makes a forgotten ledger entry a crash instead
+  of a wrong table. Costs 96B/unit and ~1.5% of the tick (4% at 130k); `--track=0` removes both.
+- **Dynasties.** `unit_t.dyn` (fits in existing padding, so free) carries the founder id down every
+  descendant. `stats.lines / top_line / top_line_worth` — lineage share is what selection actually
+  maximises, and it diverges from money.
+- **Rank history.** `trk_t.cur/peak`, sampled by `tick()` itself every 30 ticks, never by the host:
+  an unsampled rank reads as 0 rather than as missing and would silently fictionalise the mobility
+  table. Tie blocks rank at their midpoint, else a field of equals all rank at 100%.
+- **Death records.** Every life that ends folds into a 5x5 mobility matrix (born-fifth to best-fifth)
+  and per-quintile means of lifespan, children and each channel. `--deaths=` streams a CSV row each.
+- **Scenarios** (`scen.lua`, `scenarios/*.lua`): arms, tick-exact events (`set`, `shock`, `jubilee`,
+  `say`), validated hard at load. `run.lua` runs every arm over shared seeds and reports the *paired*
+  difference with a Student-t interval — unpaired comparison is useless here, since any intervention
+  shifts the random stream and the trajectory is chaotic.
+- New knobs `lending` (0 = no credit) and `usury` (rate cap) exist so credit can be ablated rather
+  than argued about; `M.jubilee()` forgives every debt without moving money.
+
+### What the measurement found
+- Lending is the mechanism of the top fifth: net lifetime credit by peak quintile is
+  `-7 -15 -36 -27 +35`. Ablating it cuts gini 0.048 +- 0.018 with **no** measurable output cost.
+- Estates of dead neighbours dwarf named inheritance as an inflow (`123..1478` vs `11..113`). The
+  scatter is local, so this is a geography effect: the rich stand in crowded towns.
+- 75% of those born poorest never leave the bottom fifth; 31% born richest die there.
+
 ## Status (2026-09-18)
 
 Run: `luajit main.lua [--seed= --speed= --shot= --no-selftest] [knobs]`. Audit: `luajit check.lua [--ticks= --seed= --fast] [knobs]`.
@@ -169,6 +200,19 @@ Circle radius is linear in net worth (money + loans - debt + goods and capital a
 - A cash reserve scaled by food price silently zeroed every tool budget once food got dear.
 
 ### Open
+- **Capital is dead, so "winning by investing" cannot be shown.** Nothing forces a loan into capital;
+  the tool sector is extinct, so founder capital decays at 0.997/tick and is gone by ~1500. The
+  mature economy is self-employed farmers plus moneylenders. Fixing the tool sector is now the
+  blocker on the whole capital story, not just an untidy corner.
+- **Nominal constants are not expressed in food-price units** (`300 + 3000*repro`, `amount >= 50`,
+  `debt < 5000`). Changing the money supply therefore changes birth rates for an artificial reason,
+  so no monetary scenario can be trusted yet. Note that a price-scaled reserve once zeroed every tool
+  budget, so this needs ablating, not just editing.
+- **No land ownership.** Nobody owns a cell, nobody collects rent, nobody works for anyone. That is
+  the largest missing inequality channel: enclosure, rentiers, foreclosure concentrating land, losing
+  by being born after the land is taken. Wage labour falls out of it afterwards.
+- **Nobody borrows to eat.** Hunger cannot be financed, so there is no debt trap; and underfed units
+  are not less productive, so poverty is not a trap either — losing is instant rather than slow.
 - Tool sector does not sustain: ~1-2M unmet tool wants per 500 ticks, ~all "no seller in range"; artisans fall
   from ~60 founders to <10. Ore and farmland are apart, food buffers are ~30 ticks, round trips are hundreds.
   Bigger buffers + slower spoilage alone did not fix it. Candidates: dedicated hauliers (long-range trade
