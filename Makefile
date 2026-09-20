@@ -1,6 +1,6 @@
 LUA ?= luajit
 
-.PHONY: run check fmt fmt-check shots
+.PHONY: run check lint fmt fmt-check ci shots
 
 run:
 	$(LUA) main.lua
@@ -8,11 +8,16 @@ run:
 check:
 	$(LUA) check.lua
 
+lint:
+	luacheck *.lua
+
 fmt:
 	stylua *.lua
 
 fmt-check:
 	stylua --check *.lua
+
+ci: fmt-check lint check
 
 # the captions in README.md are these commands; keep the two in sync
 shots:

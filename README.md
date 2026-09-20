@@ -195,12 +195,17 @@ Each gene has a cost, or it would simply evolve to 1.0 and the simulation would 
 ```sh
 make run      # windowed
 make check    # headless audit
+make lint     # luacheck
 make fmt      # stylua
+make ci       # fmt-check + lint + check
 make shots    # regenerate docs/*.png
 ```
 
 Formatting is [StyLua](https://github.com/JohnnyMorganz/StyLua) with `.stylua.toml`
-(220 columns, 2-space indent, one-line statements preserved). `make fmt-check` fails on unformatted code.
+(220 columns, 2-space indent, one-line statements preserved); `make fmt-check` fails on unformatted
+code. Linting is [luacheck](https://github.com/lunarmodules/luacheck) with `.luacheckrc`
+(`std = "luajit"`, so `ffi`, `bit` and `jit` are known globals). Both come from Homebrew:
+`brew install stylua luacheck`. The tree is warning-free; keep it that way.
 
 The simulation asserts aggressively. `sim.debug = true` turns on per-phase conservation checks inside
 `tick()`, `sim.validate()` reconciles every unit, loan and free-list against the ledger, and

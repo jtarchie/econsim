@@ -9,7 +9,7 @@ local random, min, max, log = math.random, math.min, math.max, math.log
 local CAP, GRID, CELL, NG = 16384, 128, 16, 20
 local MASK, GMASK, NC = CAP - 1, GRID - 1, GRID * GRID
 local W = GRID * CELL
-local HALF, R2 = W / 2, CELL * CELL
+local R2 = CELL * CELL
 local MAXLOANS, TERM = CAP * 4, 600
 local NFLASH, HN = 4096, 240
 
@@ -417,7 +417,7 @@ local function phase_scan(pop)
     local i = cell_items[s]
     local u, a = U[i], SC[i]
     local g, cell = u.g, u.cell
-    local cx, cy = band(cell, GMASK), floor(cell / GRID)
+    local cx = band(cell, GMASK)
     -- stubborn units never revise prices or go looking for something better; only separation moves them
     local open = 1 - u.stubborn
     local hw = g[HERD] * 0.1 * min(1, a.nn) * open
@@ -711,13 +711,13 @@ function M.tick()
   if dbg then M.check_conserved("bury", before, M.totals(), false) end
 
   if tick % 10 == 0 then
-    local pop = CAP - nfree
-    local per = pop > 0 and floor(commons / pop) or 0
+    local alive = CAP - nfree
+    local per = alive > 0 and floor(commons / alive) or 0
     if per > 0 then
       for i = 0, MASK do
         if U[i].alive == 1 then U[i].money = U[i].money + per end
       end
-      commons = commons - per * pop
+      commons = commons - per * alive
     end
   end
 end
@@ -744,7 +744,7 @@ end
 local wealth, prices, tprices = {}, {}, {}
 function M.compute_stats()
   local s = M.stats
-  local n, price, debt, artisans, capital, stubborn = 0, 0, 0, 0, 0, 0
+  local n, debt, artisans, capital, stubborn = 0, 0, 0, 0, 0
   local means = {}
   for k = 1, NG do
     means[k] = 0
@@ -771,7 +771,7 @@ function M.compute_stats()
   table.sort(tprices)
   s.stubborn = stubborn
   s.tool_price, s.artisans, s.capital = tprices[floor(n / 2) + 1] or 0, artisans, n > 0 and capital / n or 0
-  price = prices[floor(n / 2) + 1] or 0
+  local price = prices[floor(n / 2) + 1] or 0
   table.sort(wealth)
   s.median_worth = max(1, wealth[floor(n / 2) + 1] or 1)
   local cum, total = 0, 0

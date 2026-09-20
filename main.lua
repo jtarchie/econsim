@@ -2,7 +2,7 @@ local ffi = require("ffi")
 local rl = require("rl")
 local sim = require("sim")
 
-local floor, min, max, log, abs, sqrt = math.floor, math.min, math.max, math.log, math.abs, math.sqrt
+local floor, min, max, abs = math.floor, math.min, math.max, math.abs
 local RL_LINES, RL_QUADS = 1, 7
 local KEY = { SPACE = 32, MINUS = 45, EQUAL = 61, F = 70, G = 71, H = 72, L = 76, R = 82, S = 83, T = 84, LB = 91, RB = 93 }
 local W, CAP, NG, HN = sim.W, sim.CAP, sim.NG, sim.HN
