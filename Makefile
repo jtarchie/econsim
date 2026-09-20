@@ -1,6 +1,6 @@
 LUA ?= luajit
 
-.PHONY: run check lint fmt fmt-check ci shots
+.PHONY: run check lint fmt fmt-check ci shots bench bench-big
 
 run:
 	$(LUA) main.lua
@@ -18,6 +18,13 @@ fmt-check:
 	stylua --check *.lua
 
 ci: fmt-check lint check
+
+bench:
+	$(LUA) bench.lua
+
+# a quarter-million units on a 16384x16384 map; needs ~300MB
+bench-big:
+	$(LUA) bench.lua --cap=524288 --grid=1024 --pop=200000 --ticks=25 --warm=40
 
 # the captions in README.md are these commands; keep the two in sync
 shots:
