@@ -5,8 +5,10 @@ local sim = require("sim")
 local floor, min, max, abs = math.floor, math.min, math.max, math.abs
 local RL_LINES, RL_QUADS = 1, 7
 local KEY = { SPACE = 32, MINUS = 45, EQUAL = 61, F = 70, G = 71, H = 72, L = 76, R = 82, S = 83, T = 84, LB = 91, RB = 93 }
-local W, CAP, NG, HN = sim.W, sim.CAP, sim.NG, sim.HN
-local U, L, flashes, hist = sim.units, sim.loans, sim.flashes, sim.hist
+local NG, HN = sim.NG, sim.HN
+local hist = sim.hist
+-- the world is sized by init() from the cap/grid/cell knobs, so these are bound after it runs
+local W, U, L, flashes, live, nlive
 
 local function color(r, g, b, a) return ffi.new("Color", r, g, b, a or 255) end
 local WHITE, DIM, PANEL, BG = color(230, 230, 230), color(150, 150, 150), color(0, 0, 0, 185), color(12, 12, 16)
@@ -23,7 +25,6 @@ for name in RAYLIB_SYMBOLS:gmatch("%S+") do
 end
 assert(ffi.sizeof("Color") == 4 and ffi.sizeof("Vector2") == 8 and ffi.sizeof("Texture2D") == 20, "raylib struct layout mismatch")
 assert(ffi.sizeof("Image") == ffi.sizeof("void *") + 16, "raylib Image layout mismatch")
-assert(#sim.GENES == NG and sim.GRID * sim.CELL == W, "sim exports inconsistent")
 local opt = sim.parse_args(arg, {
   seed = "random seed (default: clock)",
   speed = "sim ticks per frame at start (default 2)",
@@ -48,9 +49,9 @@ rl.UnloadImage(img)
 assert(dot.id > 0, "dot texture failed to upload")
 rl.SetTextureFilter(dot, 1)
 
-local land_px = ffi.new("uint8_t[?]", sim.GRID * sim.GRID * 4)
-local land
+local land_px, land
 local function paint_land()
+  land_px = land_px or ffi.new("uint8_t[?]", sim.GRID * sim.GRID * 4)
   for c = 0, sim.GRID * sim.GRID - 1 do
     local f, o = sim.fert[c], sim.ore[c]
     land_px[c * 4], land_px[c * 4 + 1], land_px[c * 4 + 2], land_px[c * 4 + 3] = 18 + f * 20 + o * 75, 22 + f * 70 + o * 30, 18 + f * 20, 255
@@ -66,13 +67,17 @@ end
 
 local seed = opt.seed or os.time()
 sim.init(seed)
+W = sim.W
+U, L, flashes = sim.units, sim.loans, sim.flashes
+live, nlive = sim.live_set()
+assert(#sim.GENES == NG and sim.GRID * sim.CELL == W, "sim exports inconsistent")
 paint_land()
 
 -- fit the world to window height, then nudge right of the 330px stats panel
 local zoom = (opt.zoom or 1) * rl.GetScreenHeight() / W
 local cam_x, cam_y = (rl.GetScreenWidth() - W * zoom) / 2 + 90, (rl.GetScreenHeight() - W * zoom) / 2
 local speed, paused, show_links, show_flash, show_ui = opt.speed or 2, false, true, true, true
-local sel, sel_gen, drag = -1, 0, 0
+local sel_gen, drag = 0, 0
 local ticks_since_stats, tick_ms = 0, 0
 
 local function quad(x, y, r)
@@ -129,24 +134,32 @@ local function draw_world()
     rl.rlEnd()
   end
 
+  -- a continent's worth of units is mostly sub-pixel at low zoom; drawing those costs four
+  -- vertices each to tint one pixel, so skip them and keep the batch for what is actually visible
+  local rmin = 0.4 / zoom
   rl.rlSetTexture(dot.id)
   rl.rlBegin(RL_QUADS)
-  for i = 0, CAP - 1 do
-    local u = U[i]
-    if u.alive == 1 and u.stubborn == 0 then
+  for s = 0, nlive - 1 do
+    local u = U[live[s]]
+    if u.stubborn == 0 then
       local r = radius(u)
-      rl.rlColor4ub(u.cr, u.cg, u.cb, r > 8 and 150 or 235)
-      quad(u.x, u.y, r)
+      if r > rmin then
+        rl.rlColor4ub(u.cr, u.cg, u.cb, r > 8 and 150 or 235)
+        quad(u.x, u.y, r)
+      end
     end
   end
   rl.rlEnd()
   rl.rlSetTexture(0)
   rl.rlBegin(RL_QUADS)
-  for i = 0, CAP - 1 do
-    local u = U[i]
-    if u.alive == 1 and u.stubborn == 1 then
-      rl.rlColor4ub(u.cr, u.cg, u.cb, 235)
-      quad(u.x, u.y, radius(u) * 0.7)
+  for s = 0, nlive - 1 do
+    local u = U[live[s]]
+    if u.stubborn == 1 then
+      local r = radius(u) * 0.7
+      if r > rmin then
+        rl.rlColor4ub(u.cr, u.cg, u.cb, 235)
+        quad(u.x, u.y, r)
+      end
     end
   end
   rl.rlEnd()
@@ -163,6 +176,7 @@ local function draw_world()
       end
     end
   end
+  local sel = sim.selected
   if sel >= 0 then
     rl.rlColor4ub(255, 255, 255, 90)
     quad(U[sel].x, U[sel].y, radius(U[sel]) + 8)
@@ -241,6 +255,7 @@ local function draw_ui()
   line("L links   F flashes   H hide   drag pan   wheel zoom", DIM)
   line("green land = food, orange = ore.  squares = stubborn", DIM)
 
+  local sel = sim.selected
   if sel >= 0 then
     local u = U[sel]
     local x0 = rl.GetScreenWidth() - 250
@@ -268,32 +283,34 @@ end
 local function pick(mx, my)
   local wx, wy = (mx - cam_x) / zoom, (my - cam_y) / zoom
   local best, best_d = -1, (14 / zoom) ^ 2
-  for i = 0, CAP - 1 do
+  for s = 0, nlive - 1 do
+    local i = live[s]
     local u = U[i]
-    if u.alive == 1 then
-      local d = (u.x - wx) ^ 2 + (u.y - wy) ^ 2
-      if d < best_d then
-        best, best_d = i, d
-      end
+    local d = (u.x - wx) ^ 2 + (u.y - wy) ^ 2
+    if d < best_d then
+      best, best_d = i, d
     end
   end
-  sel, sel_gen = best, best >= 0 and U[best].gen or 0
+  sim.selected, sel_gen = best, best >= 0 and U[best].gen or 0
 end
 
 -- screenshot helper: --pick opens the inspector on whoever is richest at shot time
 local function pick_richest()
   local best, best_w = -1, -1
-  for i = 0, CAP - 1 do
-    local u = U[i]
-    if u.alive == 1 and sim.worth(u) > best_w then
-      best, best_w = i, sim.worth(u)
+  for s = 0, nlive - 1 do
+    local i = live[s]
+    local w = sim.worth(U[i])
+    if w > best_w then
+      best, best_w = i, w
     end
   end
-  sel, sel_gen = best, best >= 0 and U[best].gen or 0
+  sim.selected, sel_gen = best, best >= 0 and U[best].gen or 0
 end
 
 local shot, frames = opt.shot, 0
 while not rl.WindowShouldClose() do
+  -- refreshed every frame: births, deaths and compaction all move the live set
+  live, nlive = sim.live_set()
   local k = sim.knobs
   if rl.IsKeyPressed(KEY.SPACE) then paused = not paused end
   if rl.IsKeyPressed(KEY.EQUAL) then speed = min(32, speed * 2) end
@@ -311,7 +328,7 @@ while not rl.WindowShouldClose() do
     seed = seed + 1
     sim.init(seed)
     paint_land()
-    sel = -1
+    sim.selected = -1
   end
 
   local wheel = rl.GetMouseWheelMove()
@@ -339,7 +356,8 @@ while not rl.WindowShouldClose() do
       sim.compute_stats()
     end
   end
-  if sel >= 0 and (U[sel].alive ~= 1 or U[sel].gen ~= sel_gen) then sel = -1 end
+  local sel = sim.selected
+  if sel >= 0 and (U[sel].alive ~= 1 or U[sel].gen ~= sel_gen) then sim.selected = -1 end
 
   if opt.pick and shot and frames + 1 >= shot then pick_richest() end
 

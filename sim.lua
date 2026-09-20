@@ -4,14 +4,15 @@ local band = bit.band
 -- branchy per-unit loop blows default trace limits and falls back to the interpreter
 require("jit.opt").start("maxtrace=20000", "maxrecord=40000", "maxside=4000", "maxsnap=4000", "sizemcode=1024", "maxmcode=131072")
 local floor, ceil, sqrt, atan2, abs = math.floor, math.ceil, math.sqrt, math.atan2, math.abs
+local NAN = 0 / 0
 local random, min, max, log = math.random, math.min, math.max, math.log
 
-local CAP, GRID, CELL, NG = 16384, 128, 16, 20
-local MASK, GMASK, NC = CAP - 1, GRID - 1, GRID * GRID
-local W = GRID * CELL
-local R2 = CELL * CELL
-local MAXLOANS, TERM = CAP * 4, 600
-local NFLASH, HN = 4096, 240
+local NG, TERM, NFLASH, HN = 20, 600, 4096, 240
+-- world size is picked at init() from the cap/grid/cell knobs; everything below is derived from it
+local CAP, GRID, CELL = 0, 0, 0
+local MASK, GMASK, NC, W, R2, MAXLOANS, MAXPAIRS = 0, 0, 0, 0, 0, 0, 0
+-- hot loops divide by these every unit; reciprocals let the JIT multiply instead
+local INV_W, INV_CELL, INV_GRID = 0, 0, 0
 
 local PROD, RESERVE, GREED, HERD, THRIFT, INVEST, RISK, TRUST, SPEED = 0, 1, 2, 3, 4, 5, 6, 7, 8
 local SEEK_RICH, SEEK_KIN, MIGRATE, REPRO, ENDOW, INHERIT, BORROW, BUILD = 9, 10, 11, 12, 13, 14, 15, 16
@@ -68,9 +69,28 @@ local M = {
     "craft",
   },
   FLASH = { TRADE = 0, BIRTH = 1, DEATH = 2, DEFAULT = 3, LOAN = 4 },
-  knobs = { pop = 2000, money = 1500, artisans = 0.15, yield = 2.6, toolrate = 0.5, mut = 0.05, estate_tax = 0.0, shock_every = 600, stubborn_founders = 0.2, stubborn_birth = 0.02 },
+  knobs = {
+    cap = 16384,
+    grid = 128,
+    cell = 16,
+    compact_every = 4,
+    pop = 2000,
+    money = 1500,
+    artisans = 0.15,
+    yield = 2.6,
+    toolrate = 0.5,
+    mut = 0.05,
+    estate_tax = 0.0,
+    shock_every = 600,
+    stubborn_founders = 0.2,
+    stubborn_birth = 0.02,
+  },
   KNOB_HELP = {
-    pop = "founding population (1..16384)",
+    cap = "unit slots, a power of two; the hard population ceiling",
+    grid = "cells per side, a power of two; world is grid x cell units across",
+    cell = "cell size in world units; also the interaction radius",
+    compact_every = "ticks between renumbering units into cell order; 0 = never",
+    pop = "founding population (1..cap)",
     money = "money per founder; total supply = pop x money, fixed forever",
     artisans = "fraction of founders who start as tool-makers on ore land",
     yield = "food per unit labour on perfect land",
@@ -82,24 +102,23 @@ local M = {
     stubborn_birth = "chance an adaptive unit's child is stubborn",
   },
   shock = { x = 0, y = 0, r = 0, ttl = 0 },
+  -- the unit the UI is following; compaction moves slots, so the sim owns this index
+  selected = -1,
   stats = {},
 }
 
-local U = ffi.new("unit_t[?]", CAP)
-local L = ffi.new("loan_t[?]", MAXLOANS)
-local flashes = ffi.new("flash_t[?]", NFLASH)
-local free_units, free_loans = ffi.new("int32_t[?]", CAP), ffi.new("int32_t[?]", MAXLOANS)
-local dying = ffi.new("int32_t[?]", CAP)
-local cell_start, cell_cursor = ffi.new("int32_t[?]", NC + 1), ffi.new("int32_t[?]", NC + 1)
-local cell_items = ffi.new("int32_t[?]", CAP)
+local U, L, flashes, free_units, free_loans, dying, cell_start, cell_cursor, cell_items
+local opp, res, sup, dem, sup_raw, dem_raw, fert, ore
+local SC, NB, px, py, blk_x, blk_y, blk_s, pair_i, pair_j, pair_dx, pair_dy, sc_ax, sc_ay, sc_scale, sc_net, heirs, PRIMES
+-- scratch for compaction: units are rebuilt into cell order, then copied back
+local U2, nn2, remap
+-- live[] is the dense set of alive slots; without it every tick would sweep all CAP slots to find them
+local live, live_at, nlive = nil, nil, 0
 local proj = ffi.new("float[?]", NG * 2)
 local hist = ffi.new("float[?]", (4 + NG) * HN)
-local opp, res = ffi.new("float[?]", NC * 2), ffi.new("float[?]", NC * 2)
-local sup, dem = ffi.new("float[?]", NC * 2), ffi.new("float[?]", NC * 2)
-local sup_raw, dem_raw = ffi.new("float[?]", NC * 2), ffi.new("float[?]", NC * 2)
-local fert, ore = res, res + NC
-M.units, M.loans, M.flashes, M.fert, M.ore, M.hist = U, L, flashes, fert, ore, hist
+M.hist = hist
 
+local ensure_size, check_static, reset_scratch
 local nfree, nfree_loans, loan_hi, ndying, flash_head = 0, 0, 0, 0, 0
 local tick, commons, supply = 0, 0, 0
 local c_births, c_starved, c_aged, c_defaults, c_trades, c_volume, c_loans, c_spec, c_tool_vol = 0, 0, 0, 0, 0, 0, 0, 0, 0
@@ -141,7 +160,7 @@ end
 local function gauss() return sqrt(-2 * log(1 - random())) * math.cos(6.283185307 * random()) end
 
 local function wrap(v)
-  v = v - W * floor(v / W)
+  v = v - W * floor(v * INV_W)
   return v < W - 0.001 and v or 0
 end
 
@@ -153,12 +172,13 @@ local function spawn(x, y)
   ffi.fill(u, ffi.sizeof("unit_t"))
   u.gen, u.x, u.y, u.alive, u.heir, u.default_tick = gen, x, y, 1, -1, -1000000
   u.belief[FOOD], u.belief[TOOLS] = 10, 20
+  live[nlive], live_at[i], nlive = i, nlive, nlive + 1
   return i, u
 end
 
-local reset_scratch
-
 function M.init(seed)
+  M.check_knobs()
+  ensure_size()
   -- fixed seed: hue projection must match across runs so colors are comparable
   math.randomseed(1234)
   for k = 0, NG * 2 - 1 do
@@ -166,13 +186,14 @@ function M.init(seed)
   end
   math.randomseed(seed or os.time())
 
-  ffi.fill(U, ffi.sizeof(U))
-  ffi.fill(L, ffi.sizeof(L))
-  ffi.fill(flashes, ffi.sizeof(flashes))
+  ffi.fill(U, CAP * ffi.sizeof("unit_t"))
+  ffi.fill(L, MAXLOANS * ffi.sizeof("loan_t"))
+  nlive = 0
+  ffi.fill(flashes, NFLASH * ffi.sizeof("flash_t"))
   ffi.fill(hist, ffi.sizeof(hist))
-  tick, commons, loan_hi, ndying = 0, 0, 0, 0
-  ffi.fill(sup, ffi.sizeof(sup))
-  ffi.fill(dem, ffi.sizeof(dem))
+  tick, commons, loan_hi, ndying, M.selected = 0, 0, 0, 0, -1
+  ffi.fill(sup, NC * 2 * 4)
+  ffi.fill(dem, NC * 2 * 4)
   reset_scratch()
   flash_head, M.shock.x, M.shock.y, M.shock.r = 0, 0, 0, 0
   c_births, c_starved, c_aged, c_defaults, c_trades, c_volume, c_loans, c_spec, c_tool_vol = 0, 0, 0, 0, 0, 0, 0, 0, 0
@@ -205,14 +226,13 @@ function M.init(seed)
     opp[c] = res[c]
   end
 
-  M.check_knobs()
   local kn = M.knobs
   for _ = 1, kn.pop do
     local x, y
     local field = random() < kn.artisans and ore or fert
     repeat
       x, y = random() * W, random() * W
-    until field[floor(y / CELL) * GRID + floor(x / CELL)] > 0.55
+    until field[floor(y * INV_CELL) * GRID + floor(x * INV_CELL)] > 0.55
     local _, u = spawn(x, y)
     for k = 0, NG - 1 do
       u.g[k] = random()
@@ -228,31 +248,78 @@ function M.init(seed)
   M.compute_stats()
 end
 
+local max_cell, blk_n = 0, 0
+
+-- counting sort over live[], not over all CAP slots: an empty continent must not cost what a full one does
 local function build_grid()
-  for c = 0, NC do
-    cell_start[c] = 0
+  ffi.fill(cell_start, (NC + 1) * 4)
+  for s = 0, nlive - 1 do
+    local u = U[live[s]]
+    local c = band(floor(u.y * INV_CELL), GMASK) * GRID + band(floor(u.x * INV_CELL), GMASK)
+    u.cell = c
+    cell_start[c + 1] = cell_start[c + 1] + 1
   end
-  for i = 0, MASK do
-    local u = U[i]
-    if u.alive == 1 then
-      local c = band(floor(u.y / CELL), GMASK) * GRID + band(floor(u.x / CELL), GMASK)
-      u.cell = c
-      cell_start[c + 1] = cell_start[c + 1] + 1
-    end
-  end
+  local hi = 0
   for c = 1, NC do
-    cell_start[c] = cell_start[c] + cell_start[c - 1]
+    local n = cell_start[c]
+    if n > hi then hi = n end
+    cell_start[c] = n + cell_start[c - 1]
+    cell_cursor[c - 1] = cell_start[c - 1]
   end
-  for c = 0, NC do
-    cell_cursor[c] = cell_start[c]
+  cell_cursor[NC] = cell_start[NC]
+  max_cell = hi
+  -- a chunk can only end between cells, so one cell's worth of pairs must always fit
+  if blk_x == nil or 9 * hi > blk_n then
+    blk_n = max(64, 2 ^ ceil(log(18 * hi) / log(2)))
+    blk_x, blk_y = ffi.new("float[?]", blk_n), ffi.new("float[?]", blk_n)
+    blk_s = ffi.new("int32_t[?]", blk_n)
   end
-  for i = 0, MASK do
-    local u = U[i]
-    if u.alive == 1 then
-      cell_items[cell_cursor[u.cell]] = i
-      cell_cursor[u.cell] = cell_cursor[u.cell] + 1
+  if blk_n * hi >= MAXPAIRS then
+    MAXPAIRS = 2 ^ ceil(log(2 * blk_n * hi) / log(2))
+    pair_i, pair_j = ffi.new("int32_t[?]", MAXPAIRS), ffi.new("int32_t[?]", MAXPAIRS)
+    pair_dx, pair_dy = ffi.new("float[?]", MAXPAIRS), ffi.new("float[?]", MAXPAIRS)
+  end
+  for s = 0, nlive - 1 do
+    local i = live[s]
+    local c = U[i].cell
+    local at = cell_cursor[c]
+    cell_items[at] = i
+    cell_cursor[c] = at + 1
+  end
+end
+
+-- Renumber units into cell order. Every phase reads units through cell_items, so after this
+-- the gathers are sequential instead of jumping across a unit array far larger than cache.
+-- Slot identity is not economic state: the same units stay in the same visit order, so the
+-- trajectory is unchanged. Only the indices that name them move, and every reference is remapped.
+local UNIT_BYTES = ffi.sizeof("unit_t")
+local function compact()
+  ffi.fill(remap, CAP * 4, 0xFF)
+  for s = 0, nlive - 1 do
+    local i = cell_items[s]
+    remap[i], nn2[s] = s, SC[i].nn
+    ffi.copy(U2 + s, U + i, UNIT_BYTES)
+  end
+  ffi.copy(U, U2, nlive * UNIT_BYTES)
+  -- dead slots must read as never-used: validate() insists they hold no money
+  ffi.fill(U + nlive, (CAP - nlive) * UNIT_BYTES)
+  for s = 0, nlive - 1 do
+    local u = U[s]
+    local h = u.heir
+    -- an heir that died is dropped outright; previously only the gen counter caught it
+    u.heir = h >= 0 and remap[h] or -1
+    SC[s].nn, cell_items[s], live[s], live_at[s] = nn2[s], s, s, s
+  end
+  for li = 0, loan_hi - 1 do
+    local l = L[li]
+    if l.active == 1 then
+      l.lender, l.borrower = remap[l.lender], remap[l.borrower]
     end
   end
+  for k = 0, nfree - 1 do
+    free_units[k] = CAP - 1 - k
+  end
+  M.selected = M.selected >= 0 and remap[M.selected] or -1
 end
 
 local function kill(i, u)
@@ -264,26 +331,80 @@ end
 
 ffi.cdef([[
 typedef struct { double rich_m; float bel_sum[2], best_ask[2], rdx, rdy, kdx, kdy, px, py; int32_t nn, best[2], cand; } scan_t;
+/* every field the pair loop reads off a neighbour, and nothing else: 48 bytes in cell order
+   instead of chasing a 192-byte unit_t across an array far bigger than cache */
+typedef struct { float hue, bel0, bel1, ask0, ask1, sur0, sur1; double money; } nb_t;
 ]])
-local MAXPAIRS = CAP * 48
-local SC = ffi.new("scan_t[?]", CAP)
-local pair_i, pair_j = ffi.new("int32_t[?]", MAXPAIRS), ffi.new("int32_t[?]", MAXPAIRS)
 local off_x = ffi.new("int32_t[9]", -1, 0, 1, -1, 0, 1, -1, 0, 1)
 local off_y = ffi.new("int32_t[9]", -1, -1, -1, 0, 0, 0, 1, 1, 1)
-local sc_ax, sc_ay, sc_scale = ffi.new("float[?]", CAP), ffi.new("float[?]", CAP), ffi.new("float[?]", CAP * 2)
-local sc_net = ffi.new("float[?]", CAP)
 local CARRY, MINQ = ffi.new("float[2]", 300, 40), ffi.new("float[2]", 0.5, 0.05)
-local PRIMES = { 16411, 17389, 19993, 24733, 31337 }
 local unmet = ffi.new("double[8]")
+
+local function is_prime(v)
+  if v % 2 == 0 then return v == 2 end
+  for d = 3, floor(sqrt(v)), 2 do
+    if v % d == 0 then return false end
+  end
+  return true
+end
+
+-- pairs are produced in chunks so the buffer stays a fixed 8MB no matter how large CAP gets
+local PAIRCHUNK = 2 ^ 20
+
+-- (re)size every buffer to the cap/grid/cell knobs. Called from init(); a no-op when the shape is unchanged.
+ensure_size = function()
+  local k = M.knobs
+  if k.cap == CAP and k.grid == GRID and k.cell == CELL then return end
+  CAP, GRID, CELL = k.cap, k.grid, k.cell
+  MASK, GMASK, NC = CAP - 1, GRID - 1, GRID * GRID
+  W, R2, MAXLOANS = GRID * CELL, CELL * CELL, CAP
+  INV_W, INV_CELL, INV_GRID = 1 / W, 1 / CELL, 1 / GRID
+  MAXPAIRS = min(PAIRCHUNK, CAP * 16)
+
+  U = ffi.new("unit_t[?]", CAP)
+  L = ffi.new("loan_t[?]", MAXLOANS)
+  flashes = ffi.new("flash_t[?]", NFLASH)
+  free_units, free_loans = ffi.new("int32_t[?]", CAP), ffi.new("int32_t[?]", MAXLOANS)
+  dying, heirs = ffi.new("int32_t[?]", CAP), ffi.new("int32_t[?]", CAP)
+  live, live_at = ffi.new("int32_t[?]", CAP), ffi.new("int32_t[?]", CAP)
+  cell_start, cell_cursor = ffi.new("int32_t[?]", NC + 1), ffi.new("int32_t[?]", NC + 1)
+  cell_items = ffi.new("int32_t[?]", CAP)
+  opp, res = ffi.new("float[?]", NC * 2), ffi.new("float[?]", NC * 2)
+  sup, dem = ffi.new("float[?]", NC * 2), ffi.new("float[?]", NC * 2)
+  sup_raw, dem_raw = ffi.new("float[?]", NC * 2), ffi.new("float[?]", NC * 2)
+  fert, ore = res, res + NC
+  SC = ffi.new("scan_t[?]", CAP)
+  NB = ffi.new("nb_t[?]", CAP)
+  px, py = ffi.new("float[?]", CAP), ffi.new("float[?]", CAP)
+  U2, nn2, remap = ffi.new("unit_t[?]", CAP), ffi.new("int32_t[?]", CAP), ffi.new("int32_t[?]", CAP)
+  pair_i, pair_j = ffi.new("int32_t[?]", MAXPAIRS), ffi.new("int32_t[?]", MAXPAIRS)
+  pair_dx, pair_dy = ffi.new("float[?]", MAXPAIRS), ffi.new("float[?]", MAXPAIRS)
+  sc_ax, sc_ay = ffi.new("float[?]", CAP), ffi.new("float[?]", CAP)
+  sc_scale, sc_net = ffi.new("float[?]", CAP * 2), ffi.new("float[?]", CAP)
+
+  -- trade/lend visit order is a coprime stride, so the strides must exceed any population
+  PRIMES = {}
+  local p = CAP
+  for n = 1, 5 do
+    repeat
+      p = p + 1
+    until is_prime(p)
+    PRIMES[n] = p
+  end
+
+  M.CAP, M.W, M.GRID, M.CELL, M.MAXLOANS = CAP, W, GRID, CELL, MAXLOANS
+  M.units, M.loans, M.flashes, M.fert, M.ore = U, L, flashes, fert, ore
+  check_static()
+end
 
 -- scratch carries last tick's scan into produce(); stale values from a previous run made reseeded runs diverge
 function reset_scratch()
-  ffi.fill(SC, ffi.sizeof(SC))
-  ffi.fill(sc_ax, ffi.sizeof(sc_ax))
-  ffi.fill(sc_ay, ffi.sizeof(sc_ay))
-  ffi.fill(sc_scale, ffi.sizeof(sc_scale))
-  ffi.fill(sc_net, ffi.sizeof(sc_net))
-  ffi.fill(cell_start, ffi.sizeof(cell_start))
+  ffi.fill(SC, CAP * ffi.sizeof("scan_t"))
+  ffi.fill(sc_ax, CAP * 4)
+  ffi.fill(sc_ay, CAP * 4)
+  ffi.fill(sc_scale, CAP * 2 * 4)
+  ffi.fill(sc_net, CAP * 4)
+  ffi.fill(cell_start, (NC + 1) * 4)
 end
 
 local function upkeep_of(g) return 0.6 + 0.8 * g[PROD] end
@@ -344,78 +465,134 @@ local function update_fields(pop)
     sup_raw[c], sup_raw[NC + c] = sup_raw[c] + max(0, u.surplus[0]), sup_raw[NC + c] + max(0, u.surplus[1])
     dem_raw[c], dem_raw[NC + c] = dem_raw[c] + max(0, -u.surplus[0]) * solvent, dem_raw[NC + c] + max(0, -u.surplus[1]) * solvent
   end
-  for c = 0, NC - 1 do
-    local n = cell_start[c + 1] - cell_start[c]
-    local cx, row = band(c, GMASK), c - band(c, GMASK)
-    local l, r = row + band(cx - 1, GMASK), row + band(cx + 1, GMASK)
-    local up, dn = band(c - GRID, NC - 1), band(c + GRID, NC - 1)
-    for k = 0, NC, NC do
-      opp[k + c] = max(res[k + c] / (1 + 0.5 * n), max(opp[k + l], opp[k + r], opp[k + up], opp[k + dn]) * 0.99)
-      sup[k + c] = max(sup_raw[k + c], max(sup[k + l], sup[k + r], sup[k + up], sup[k + dn]) * 0.95)
-      dem[k + c] = max(dem_raw[k + c], max(dem[k + l], dem[k + r], dem[k + up], dem[k + dn]) * 0.95)
+  -- Blocked by row, with the left neighbour carried in a register. Every cell's new value is
+  -- the next cell's left input, so reading it back from the array serialised the sweep on a
+  -- store-to-load forward; keeping it live halves the cost. Splitting the six fields into
+  -- separate passes was tried and lost -- they share this index arithmetic.
+  for row = 0, NC - 1, GRID do
+    local ub, db, e = band(row - GRID, NC - 1), band(row + GRID, NC - 1), row + GMASK
+    local p1, p2, p3 = opp[e], sup[e], dem[e]
+    local q1, q2, q3 = opp[NC + e], sup[NC + e], dem[NC + e]
+    for cx = 0, GMASK do
+      local c = row + cx
+      local r = cx == GMASK and row or c + 1
+      local up, dn = ub + cx, db + cx
+      local crowd = 1 + 0.5 * (cell_start[c + 1] - cell_start[c])
+      p1 = max(res[c] / crowd, max(p1, opp[r], opp[up], opp[dn]) * 0.99)
+      p2 = max(sup_raw[c], max(p2, sup[r], sup[up], sup[dn]) * 0.95)
+      p3 = max(dem_raw[c], max(p3, dem[r], dem[up], dem[dn]) * 0.95)
+      opp[c], sup[c], dem[c] = p1, p2, p3
+      local c2, r2, u2, d2 = NC + c, NC + r, NC + up, NC + dn
+      q1 = max(res[c2] / crowd, max(q1, opp[r2], opp[u2], opp[d2]) * 0.99)
+      q2 = max(sup_raw[c2], max(q2, sup[r2], sup[u2], sup[d2]) * 0.95)
+      q3 = max(dem_raw[c2], max(q3, dem[r2], dem[u2], dem[d2]) * 0.95)
+      opp[c2], sup[c2], dem[c2] = q1, q2, q3
     end
   end
 end
 
-local function build_pairs(pop)
-  local P = 0
-  for s = 0, pop - 1 do
-    local i = cell_items[s]
-    local cell = U[i].cell
-    local cx, cy = band(cell, GMASK), floor(cell / GRID)
-    for n = 0, 8 do
-      local c = band(cy + off_y[n], GMASK) * GRID + band(cx + off_x[n], GMASK)
-      local t0 = cell_start[c]
-      for t = t0, min(cell_start[c + 1], t0 + MAXPAIRS - P) - 1 do
-        pair_i[P], pair_j[P] = i, cell_items[t]
-        P = P + 1
+-- Emits one chunk of pairs and returns where to resume, so the buffer stays a fixed size
+-- however large the world gets. A unit's whole 3x3 block is always emitted together, so the
+-- chunk can only end on a unit boundary; build_grid guarantees the headroom for that.
+-- The 3x3 block is 2304 square units but the interaction disc is only 804, so two thirds of
+-- candidates are out of range. Rejecting them here, in a loop that walks NB in cell order and
+-- touches nothing else, keeps them out of the branchy consumer below.
+-- Every unit in a cell scans the same 3x3 block, so gather that block once into a small
+-- contiguous scratch and let the whole cell test against it out of L1. Walking cell_items
+-- per unit instead meant nine scattered streams re-read for every unit in the cell.
+-- Cells and units are visited in cell_items order, so the pair list is byte-identical to a
+-- per-unit walk; the chunk boundary just moves from a unit to a cell.
+local function build_pairs(c0)
+  local P, c, limit = 0, c0, MAXPAIRS - blk_n * max_cell
+  while c < NC do
+    local lo, hi = cell_start[c], cell_start[c + 1]
+    if hi > lo then
+      local cx, cy, m = band(c, GMASK), floor(c * INV_GRID), 0
+      for n = 0, 8 do
+        local nx, ny = cx + off_x[n], cy + off_y[n]
+        -- the seam is a property of the neighbour cell, not of each candidate
+        local ox = nx < 0 and -W or (nx >= GRID and W or 0)
+        local oy = ny < 0 and -W or (ny >= GRID and W or 0)
+        local nc = band(ny, GMASK) * GRID + band(nx, GMASK)
+        for t = cell_start[nc], cell_start[nc + 1] - 1 do
+          blk_x[m], blk_y[m], blk_s[m] = px[t] + ox, py[t] + oy, t
+          m = m + 1
+        end
+      end
+      for s = lo, hi - 1 do
+        local ux, uy, i = px[s], py[s], cell_items[s]
+        for k = 0, m - 1 do
+          local dx, dy = blk_x[k] - ux, blk_y[k] - uy
+          local t = blk_s[k]
+          -- a dying unit carries a NaN position, so this comparison rejects it without a flag load
+          if dx * dx + dy * dy < R2 and t ~= s then
+            pair_i[P], pair_j[P], pair_dx[P], pair_dy[P] = i, t, dx, dy
+            P = P + 1
+          end
+        end
       end
     end
+    c = c + 1
+    if P > limit then break end
   end
-  return P
+  return P, c
 end
 
 local function phase_scan(pop)
+  -- gather the neighbour view once; the pair loop then reads it ~9 times per unit
   for s = 0, pop - 1 do
     local i = cell_items[s]
-    local a = SC[i]
-    a.nn, a.cand, a.rich_m = 0, -1, U[i].money
+    local u, b, a = U[i], NB[s], SC[i]
+    -- NaN position = invisible to the pair filter; dying units must not be anyone's neighbour
+    px[s], py[s] = u.alive == 1 and u.x or NAN, u.alive == 1 and u.y or NAN
+    b.hue, b.money = u.hue, u.money
+    b.bel0, b.bel1 = u.belief[0], u.belief[1]
+    b.ask0, b.ask1 = u.ask[0], u.ask[1]
+    b.sur0, b.sur1 = u.surplus[0], u.surplus[1]
+    a.nn, a.cand, a.rich_m = 0, -1, u.money
     a.best[0], a.best[1], a.best_ask[0], a.best_ask[1], a.bel_sum[0], a.bel_sum[1] = -1, -1, 1e30, 1e30, 0, 0
     a.rdx, a.rdy, a.kdx, a.kdy, a.px, a.py = 0, 0, 0, 0, 0, 0
   end
 
-  -- flat pair loop: nesting the branchy body inside the 3x3 cell loops explodes LuaJIT side traces
-  for p = 0, build_pairs(pop) - 1 do
-    local i, j = pair_i[p], pair_j[p]
-    local u, o = U[i], U[j]
-    local dx, dy = o.x - u.x, o.y - u.y
-    dx, dy = dx - W * floor(dx / W + 0.5), dy - W * floor(dy / W + 0.5)
-    local d2 = dx * dx + dy * dy
-    if d2 < R2 and j ~= i and o.alive == 1 then
-      local a = SC[i]
+  -- flat pair loop: nesting the branchy body inside the 3x3 cell loops explodes LuaJIT side traces.
+  -- best[]/cand collect neighbour SLOTS here and are translated to unit indices below.
+  local at = 0
+  repeat
+    local P
+    P, at = build_pairs(at)
+    -- a short per-unit inner loop lost to trace-entry overhead; one long flat loop wins even
+    -- though every accumulator is then a read-modify-write against SC
+    for p = 0, P - 1 do
+      local i, j = pair_i[p], pair_j[p]
+      local o, a = NB[j], SC[i]
+      local dx, dy = pair_dx[p], pair_dy[p]
+      local hue = U[i].hue
       local nn = a.nn + 1
-      a.nn, a.bel_sum[0], a.bel_sum[1] = nn, a.bel_sum[0] + o.belief[0], a.bel_sum[1] + o.belief[1]
+      a.nn, a.bel_sum[0], a.bel_sum[1] = nn, a.bel_sum[0] + o.bel0, a.bel_sum[1] + o.bel1
       -- jittered ask: without it every buyer mobs the single cheapest seller and most orders fail
       local jit = 1 + 0.3 * random()
-      if o.surplus[0] > 0.5 and o.ask[0] * jit < a.best_ask[0] then
-        a.best[0], a.best_ask[0] = j, o.ask[0] * jit
+      if o.sur0 > 0.5 and o.ask0 * jit < a.best_ask[0] then
+        a.best[0], a.best_ask[0] = j, o.ask0 * jit
       end
-      if o.surplus[1] > 0.05 and o.ask[1] * jit < a.best_ask[1] then
-        a.best[1], a.best_ask[1] = j, o.ask[1] * jit
+      if o.sur1 > 0.05 and o.ask1 * jit < a.best_ask[1] then
+        a.best[1], a.best_ask[1] = j, o.ask1 * jit
       end
       if random() * nn < 1 then a.cand = j end
       if o.money > a.rich_m then
         a.rich_m, a.rdx, a.rdy = o.money, dx, dy
       end
-      local kw = 1 - (180 - abs(abs(o.hue - u.hue) - 180)) / 90
-      local pw = max(0, 1 - d2 / 64)
+      local kw = 1 - (180 - abs(abs(o.hue - hue) - 180)) / 90
+      local pw = max(0, 1 - (dx * dx + dy * dy) / 64)
       a.kdx, a.kdy, a.px, a.py = a.kdx + dx * kw, a.kdy + dy * kw, a.px - dx * pw, a.py - dy * pw
     end
-  end
+  until at >= NC
 
   for s = 0, pop - 1 do
     local i = cell_items[s]
     local u, a = U[i], SC[i]
+    a.best[0] = a.best[0] >= 0 and cell_items[a.best[0]] or -1
+    a.best[1] = a.best[1] >= 0 and cell_items[a.best[1]] or -1
+    a.cand = a.cand >= 0 and cell_items[a.cand] or -1
     local g, cell = u.g, u.cell
     local cx = band(cell, GMASK)
     -- stubborn units never revise prices or go looking for something better; only separation moves them
@@ -449,8 +626,12 @@ end
 
 local function phase_trade(pop, start, stride, k)
   local urge_gene = k == FOOD and THRIFT or BUILD
-  for n = 0, pop - 1 do
-    local i = cell_items[(start + n * stride) % pop]
+  local at = start % pop
+  stride = stride % pop
+  for _ = 0, pop - 1 do
+    local i = cell_items[at]
+    at = at + stride
+    if at >= pop then at = at - pop end
     local u = U[i]
     if u.alive == 1 then
       local g, best, want = u.g, SC[i].best[k], u.surplus[k] < 0
@@ -494,8 +675,12 @@ local function phase_trade(pop, start, stride, k)
 end
 
 local function phase_lend(pop, start, stride)
-  for k = 0, pop - 1 do
-    local i = cell_items[(start + k * stride) % pop]
+  local at = start % pop
+  stride = stride % pop
+  for _ = 0, pop - 1 do
+    local i = cell_items[at]
+    at = at + stride
+    if at >= pop then at = at - pop end
     local u = U[i]
     local g, cand = u.g, SC[i].cand
     if u.alive == 1 and cand >= 0 and u.nloans < 4 and nfree_loans > 0 and random() < g[INVEST] * 0.05 then
@@ -531,7 +716,7 @@ local function phase_move(pop)
       u.vx, u.vy = vx, vy
       -- separation bypasses the speed gene: sedentary units still can't stack, which bounds pair count
       local x, y = u.x + vx + max(-1, min(1, SC[i].px * 0.15)), u.y + vy + max(-1, min(1, SC[i].py * 0.15))
-      u.x, u.y = x - W * floor(x / W), y - W * floor(y / W)
+      u.x, u.y = x - W * floor(x * INV_W), y - W * floor(y * INV_W)
       -- W minus a hair rounds up to W in float32 storage
       if u.x >= W then u.x = 0 end
       if u.y >= W then u.y = 0 end
@@ -638,7 +823,6 @@ local function step_loans()
   end
 end
 
-local heirs = ffi.new("int32_t[?]", CAP)
 local function bury()
   for k = 0, ndying - 1 do
     local i = dying[k]
@@ -668,6 +852,10 @@ local function bury()
     u.money, u.alive, u.gen = 0, 0, u.gen + 1
     free_units[nfree] = i
     nfree = nfree + 1
+    -- swap-remove keeps live[] dense; order is not index order, but it is reproducible
+    local at, last = live_at[i], live[nlive - 1]
+    nlive = nlive - 1
+    live[at], live_at[last] = last, at
   end
   ndying = 0
 end
@@ -675,6 +863,8 @@ end
 function M.tick()
   tick = tick + 1
   build_grid()
+  local ce = M.knobs.compact_every
+  if ce > 0 and tick % ce == 0 then compact() end
 
   local sh = M.shock
   if sh.ttl > 0 then
@@ -714,8 +904,9 @@ function M.tick()
     local alive = CAP - nfree
     local per = alive > 0 and floor(commons / alive) or 0
     if per > 0 then
-      for i = 0, MASK do
-        if U[i].alive == 1 then U[i].money = U[i].money + per end
+      for s = 0, nlive - 1 do
+        local u = U[live[s]]
+        u.money = u.money + per
       end
       commons = commons - per * alive
     end
@@ -729,8 +920,8 @@ end
 
 function M.check_money()
   local sum = commons
-  for i = 0, MASK do
-    if U[i].alive == 1 then sum = sum + U[i].money end
+  for s = 0, nlive - 1 do
+    sum = sum + U[live[s]].money
   end
   assert(sum == supply, ("money leak at tick %d: %.0f ~= %.0f"):format(tick, sum, supply))
 end
@@ -741,60 +932,126 @@ function M.worth(u)
   return max(0, u.money + u.lent - u.debt + u.stock[0] * (s.price or 10) + (u.stock[1] + u.capital) * (s.tool_price or 20))
 end
 
-local wealth, prices, tprices = {}, {}, {}
+-- Order statistics over a sample, not the whole population. Sorting three Lua tables of a
+-- quarter-million entries cost more than a tick and grew the Lua heap into the hundreds of MB;
+-- these FFI buffers are fixed-size and allocation-free. Below SAMPLE units nothing is sampled,
+-- so the small worlds this started as still report exact figures.
+local SAMPLE = 16384
+local sw, sp, st = ffi.new("double[?]", SAMPLE), ffi.new("double[?]", SAMPLE), ffi.new("double[?]", SAMPLE)
+local gsum = ffi.new("double[?]", NG)
+local LOG10 = log(10)
+
+local function insertion(a, lo, hi)
+  for i = lo + 1, hi do
+    local v, j = a[i], i - 1
+    while j >= lo and a[j] > v do
+      a[j + 1] = a[j]
+      j = j - 1
+    end
+    a[j + 1] = v
+  end
+end
+
+-- introsort on a double array. Deliberately does not use math.random for its pivot: stats are
+-- computed between ticks, and drawing from the sim's RNG stream there would make the trajectory
+-- depend on how often the caller asked for stats.
+local function sortd(a, lo, hi)
+  while hi - lo > 24 do
+    local mid = lo + floor((hi - lo) / 2)
+    if a[mid] < a[lo] then
+      a[mid], a[lo] = a[lo], a[mid]
+    end
+    if a[hi] < a[lo] then
+      a[hi], a[lo] = a[lo], a[hi]
+    end
+    if a[hi] < a[mid] then
+      a[hi], a[mid] = a[mid], a[hi]
+    end
+    local p, i, j = a[mid], lo, hi
+    repeat
+      while a[i] < p do
+        i = i + 1
+      end
+      while a[j] > p do
+        j = j - 1
+      end
+      if i <= j then
+        a[i], a[j] = a[j], a[i]
+        i, j = i + 1, j - 1
+      end
+    until i > j
+    -- recurse into the smaller half, iterate on the larger: bounds stack depth at log2(n)
+    if j - lo < hi - i then
+      sortd(a, lo, j)
+      lo = i
+    else
+      sortd(a, i, hi)
+      hi = j
+    end
+  end
+  insertion(a, lo, hi)
+end
+
 function M.compute_stats()
   local s = M.stats
   local n, debt, artisans, capital, stubborn = 0, 0, 0, 0, 0
-  local means = {}
-  for k = 1, NG do
-    means[k] = 0
+  local bins = s.wealth_bins
+  ffi.fill(gsum, NG * 8)
+  for b = 1, 24 do
+    bins[b] = 0
   end
-  for i = 0, MASK do
-    local u = U[i]
+  -- worth is valued at the previous pass's prices, as it always was: this pass sets the new ones
+  local pf, pt = s.price or 10, s.tool_price or 20
+  local stride = max(1, ceil(nlive / SAMPLE))
+  local m = 0
+  for k = 0, nlive - 1 do
+    local u = U[live[k]]
     if u.alive == 1 then
+      local w = max(0, u.money + u.lent - u.debt + u.stock[0] * pf + (u.stock[1] + u.capital) * pt)
+      if n % stride == 0 and m < SAMPLE then
+        sw[m], sp[m], st[m] = w, u.belief[FOOD], u.belief[TOOLS]
+        m = m + 1
+      end
       n = n + 1
-      wealth[n] = M.worth(u)
-      prices[n], tprices[n] = u.belief[FOOD], u.belief[TOOLS]
       capital = capital + u.capital
       if u.g[CRAFT] > 0.5 then artisans = artisans + 1 end
       stubborn = stubborn + u.stubborn
       debt = debt + u.debt
-      for k = 1, NG do
-        means[k] = means[k] + u.g[k - 1]
+      for g = 0, NG - 1 do
+        gsum[g] = gsum[g] + u.g[g]
       end
+      local b = min(24, 1 + floor(log(w + 1) / LOG10 * 4))
+      bins[b] = bins[b] + 1
     end
   end
-  for k = #wealth, n + 1, -1 do
-    wealth[k], prices[k], tprices[k] = nil, nil, nil
+
+  if m > 0 then
+    sortd(sp, 0, m - 1)
+    sortd(st, 0, m - 1)
+    sortd(sw, 0, m - 1)
   end
-  table.sort(prices)
-  table.sort(tprices)
-  s.stubborn = stubborn
-  s.tool_price, s.artisans, s.capital = tprices[floor(n / 2) + 1] or 0, artisans, n > 0 and capital / n or 0
-  local price = prices[floor(n / 2) + 1] or 0
-  table.sort(wealth)
-  s.median_worth = max(1, wealth[floor(n / 2) + 1] or 1)
+  local mid = floor(m / 2)
+  s.price = m > 0 and sp[mid] or 0
+  s.tool_price = m > 0 and st[mid] or 0
+  s.median_worth = max(1, m > 0 and sw[mid] or 1)
+  s.artisans, s.capital, s.stubborn = artisans, n > 0 and capital / n or 0, stubborn
+
   local cum, total = 0, 0
-  for k = 1, n do
-    cum, total = cum + k * wealth[k], total + wealth[k]
+  for k = 0, m - 1 do
+    cum, total = cum + (k + 1) * sw[k], total + sw[k]
   end
-  s.gini = (n > 0 and total > 0) and (2 * cum / (n * total) - (n + 1) / n) or 0
-  s.top1 = 0
-  for k = max(1, n - floor(n / 100) + 1), n do
-    s.top1 = s.top1 + wealth[k]
+  s.gini = (m > 0 and total > 0) and min(1, max(0, 2 * cum / (m * total) - (m + 1) / m)) or 0
+  local top = 0
+  for k = max(0, m - floor(m / 100)), m - 1 do
+    top = top + sw[k]
   end
-  s.top1 = total > 0 and s.top1 / total or 0
-  for b = 1, 24 do
-    s.wealth_bins[b] = 0
-  end
-  for k = 1, n do
-    local b = min(24, 1 + floor(log(wealth[k] + 1) / log(10) * 4))
-    s.wealth_bins[b] = s.wealth_bins[b] + 1
-  end
+  s.top1 = total > 0 and top / total or 0
+
+  local means = s.means or {}
   for k = 1, NG do
-    means[k] = n > 0 and means[k] / n or 0
+    means[k] = n > 0 and gsum[k - 1] / n or 0
   end
-  s.pop, s.price, s.debt, s.means, s.tick, s.commons = n, price, debt, means, tick, commons
+  s.pop, s.debt, s.means, s.tick, s.commons = n, debt, means, tick, commons
   s.nloans = MAXLOANS - nfree_loans
   s.births, s.starved, s.aged, s.defaults = c_births, c_starved, c_aged, c_defaults
   s.trades, s.volume, s.new_loans, s.spec, s.tool_volume = c_trades, c_volume, c_loans, c_spec, c_tool_vol
@@ -815,6 +1072,9 @@ end
 
 function M.loan_hi() return loan_hi end
 
+-- renderer walks these instead of all CAP slots
+function M.live_set() return live, nlive end
+
 ---------------------------------------------------------------------------------------------------
 -- Assertions. Static ones run at load; state ones run per phase when M.debug, and in M.selftest().
 ---------------------------------------------------------------------------------------------------
@@ -825,8 +1085,8 @@ local function finite(v) return v == v and v > -math.huge and v < math.huge end
 local function whole(v) return v == floor(v) end
 local function pow2(v) return v > 0 and band(v, v - 1) == 0 end
 
-do
-  check(pow2(CAP) and pow2(GRID) and pow2(NFLASH), "CAP/GRID/NFLASH must be powers of two (band() masks depend on it)")
+check_static = function()
+  check(pow2(CAP) and pow2(GRID) and pow2(NFLASH), "cap/grid and NFLASH must be powers of two (band() masks depend on it)")
   check(MASK == CAP - 1 and GMASK == GRID - 1 and NC == GRID * GRID and W == GRID * CELL, "derived constants out of sync")
   check(R2 <= CELL * CELL, "interaction radius %g exceeds cell size %d: the 3x3 scan would miss neighbours", sqrt(R2), CELL)
   check(#M.GENES == NG, "GENES has %d names for %d genes", #M.GENES, NG)
@@ -838,23 +1098,27 @@ do
     check(k >= 0 and k < NG and not seen[k], "gene index %d out of range or duplicated", k)
     seen[k] = true
   end
+  check(#PRIMES == 5, "%d visit strides, expected 5", #PRIMES)
   for _, p in ipairs(PRIMES) do
-    check(p > CAP, "stride %d must exceed CAP so it is coprime with every population size", p)
-    for d = 2, floor(sqrt(p)) do
-      check(p % d ~= 0, "stride %d is not prime", p)
-    end
+    check(p > CAP and is_prime(p), "stride %d must be a prime above cap so it is coprime with every population size", p)
   end
-  check(MAXPAIRS >= CAP * 9, "pair buffer too small")
+  check(MAXPAIRS >= 9, "pair buffer holds %d, too small for one unit's neighbourhood", MAXPAIRS)
   check(ffi.sizeof(hist) == (4 + NG) * HN * 4, "hist buffer does not match 4 + NG series")
   check(ffi.sizeof(res) == NC * 2 * 4 and ffi.sizeof(opp) == ffi.sizeof(res) and ffi.sizeof(sup) == ffi.sizeof(res) and ffi.sizeof(dem) == ffi.sizeof(res), "field buffers must hold 2 goods x NC cells")
   check(TERM > 0, "TERM must be positive")
   check(FOOD == 0 and TOOLS == 1, "goods are indexed 0/1 by phase_trade and the k=0,NC,NC field loops")
   check(CARRY[0] > MINQ[0] and CARRY[1] > MINQ[1], "CARRY must exceed MINQ or speculation can never trade")
+  check(W * INV_W == 1 and CELL * INV_CELL == 1 and GRID * INV_GRID == 1, "reciprocal constants do not invert their divisors exactly")
 end
 
 function M.check_knobs()
   local k = M.knobs
-  check(whole(k.pop) and k.pop >= 1 and k.pop <= CAP, "knob pop=%g must be an integer in 1..%d", k.pop, CAP)
+  check(pow2(k.cap) and k.cap <= 2 ^ 26, "knob cap=%g must be a power of two, at most %d", k.cap, 2 ^ 26)
+  check(pow2(k.grid) and k.grid >= 4, "knob grid=%g must be a power of two, at least 4", k.grid)
+  check(whole(k.compact_every) and k.compact_every >= 0, "knob compact_every=%g must be a whole number", k.compact_every)
+  check(pow2(k.cell) and k.cell >= 4, "knob cell=%g must be a power of two, at least 4 (exact reciprocals)", k.cell)
+  check(k.cap <= k.grid * k.grid * 64, "cap=%g units will not fit in %d cells; raise grid", k.cap, k.grid * k.grid)
+  check(whole(k.pop) and k.pop >= 1 and k.pop <= k.cap, "knob pop=%g must be an integer in 1..%d", k.pop, k.cap)
   check(whole(k.money) and k.money >= 1 and k.pop * k.money < 2 ^ 52, "knob money=%g must be a positive integer (supply stays exact in a double)", k.money)
   check(k.artisans >= 0 and k.artisans <= 1, "knob artisans=%g outside [0,1]", k.artisans)
   check(k.yield > 0 and k.toolrate > 0, "knobs yield=%g toolrate=%g must be positive", k.yield, k.toolrate)
@@ -867,8 +1131,8 @@ end
 
 function M.totals()
   local t = { money = commons, food = 0, tools = 0, capital = 0, pop = 0 }
-  for i = 0, MASK do
-    local u = U[i]
+  for s = 0, nlive - 1 do
+    local u = U[live[s]]
     if u.alive ~= 0 then
       t.money, t.food, t.tools, t.capital = t.money + u.money, t.food + u.stock[0], t.tools + u.stock[1], t.capital + u.capital
       t.pop = t.pop + 1
@@ -891,7 +1155,10 @@ end
 function M.check_grid()
   check(cell_start[0] == 0, "cell_start[0]=%d", cell_start[0])
   local alive = 0
-  for i = 0, MASK do
+  check(nlive == CAP - nfree, "live list holds %d, %d slots are in use", nlive, CAP - nfree)
+  for s = 0, nlive - 1 do
+    local i = live[s]
+    check(live_at[i] == s, "live_at[%d]=%d but it sits at %d", i, live_at[i], s)
     if U[i].alive == 1 then alive = alive + 1 end
     check(U[i].alive <= 1, "unit %d still marked dying (alive=2) at tick start", i)
   end
@@ -902,7 +1169,7 @@ function M.check_grid()
       local i = cell_items[s]
       check(i >= 0 and i < CAP and U[i].alive == 1 and U[i].cell == c, "cell %d lists unit %d (alive=%d cell=%d)", c, i, U[i].alive, U[i].cell)
       local u = U[i]
-      check(band(floor(u.y / CELL), GMASK) * GRID + band(floor(u.x / CELL), GMASK) == c, "unit %d at (%.1f,%.1f) filed under cell %d", i, u.x, u.y, c)
+      check(band(floor(u.y * INV_CELL), GMASK) * GRID + band(floor(u.x * INV_CELL), GMASK) == c, "unit %d at (%.1f,%.1f) filed under cell %d", i, u.x, u.y, c)
     end
   end
 end
@@ -935,6 +1202,9 @@ function M.check_fields()
   end
 end
 
+-- lazily sized: only runs that actually call validate() pay for these
+local v_debt, v_lent, v_nl, v_n = nil, nil, nil, 0
+
 -- full state audit; valid between ticks
 function M.validate()
   M.check_knobs()
@@ -944,7 +1214,15 @@ function M.validate()
   check(loan_hi >= 0 and loan_hi <= MAXLOANS, "loan_hi=%d", loan_hi)
 
   local alive, money = 0, commons
-  local debt, lent, nl = {}, {}, {}
+  -- FFI, not Lua tables keyed by unit index: at continental cap the hash tables alone ran to
+  -- hundreds of MB, which put the full audit out of reach on exactly the runs that need it
+  if v_n ~= CAP then
+    v_debt, v_lent, v_nl, v_n = ffi.new("double[?]", CAP), ffi.new("double[?]", CAP), ffi.new("int32_t[?]", CAP), CAP
+  end
+  local debt, lent, nl = v_debt, v_lent, v_nl
+  ffi.fill(nl, CAP * 4)
+  ffi.fill(debt, CAP * 8)
+  ffi.fill(lent, CAP * 8)
   for i = 0, MASK do
     local u = U[i]
     check(u.alive <= 1, "unit %d alive=%d between ticks", i, u.alive)
@@ -973,7 +1251,6 @@ function M.validate()
       for k = 0, NG - 1 do
         check(u.g[k] >= 0 and u.g[k] <= 1, "unit %d gene %s=%g outside [0,1]", i, M.GENES[k + 1], u.g[k])
       end
-      debt[i], lent[i], nl[i] = 0, 0, 0
     end
   end
   check(money == supply, "money %.0f ~= supply %.0f", money, supply)
@@ -1011,8 +1288,9 @@ function M.validate()
     check(li >= 0 and li < MAXLOANS and L[li].active == 0 and not seen[li], "free loan entry %d (slot %d) is active, out of range, or duplicated", k, li)
     seen[li] = true
   end
-  for i, d in pairs(debt) do
-    check(U[i].debt == d, "unit %d debt %.0f ~= %.0f owed on its loans", i, U[i].debt, d)
+  for k = 0, nlive - 1 do
+    local i = live[k]
+    check(U[i].debt == debt[i], "unit %d debt %.0f ~= %.0f owed on its loans", i, U[i].debt, debt[i])
     check(U[i].lent == lent[i], "unit %d lent %.0f ~= %.0f owed to it", i, U[i].lent, lent[i])
     check(U[i].nloans == nl[i], "unit %d nloans %d ~= %d loans it holds", i, U[i].nloans, nl[i])
   end
@@ -1053,8 +1331,37 @@ local function fingerprint()
   return h
 end
 
+-- the stats sort is hand-rolled, so prove it rather than trust it: duplicates, negatives,
+-- already-sorted and reversed runs all hit different paths through the partition
+local function check_sort()
+  local N = 1000
+  local probe = ffi.new("double[?]", N)
+  local pats = {
+    function(k) return (k * 97) % 23 - 11 end,
+    function(k) return k end,
+    function(k) return N - k end,
+    function(_) return 7 end,
+    function(k) return k < N / 2 and 1 or 0 end,
+  }
+  for pi, f in ipairs(pats) do
+    local sum = 0
+    for k = 0, N - 1 do
+      probe[k] = f(k)
+      sum = sum + probe[k]
+    end
+    sortd(probe, 0, N - 1)
+    local out = 0
+    for k = 0, N - 1 do
+      out = out + probe[k]
+      check(k == 0 or probe[k] >= probe[k - 1], "stats sort (pattern %d) left %g before %g", pi, probe[k - 1], probe[k])
+    end
+    check(out == sum, "stats sort (pattern %d) changed the multiset: %g -> %g", pi, sum, out)
+  end
+end
+
 -- short audited run; call before opening a window so a broken build fails at startup, not mid-demo
 function M.selftest(ticks)
+  check_sort()
   local was, mine = M.debug, M.knobs
   M.debug, M.knobs = true, DEFAULTS
   local prints = {}
