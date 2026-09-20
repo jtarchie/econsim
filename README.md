@@ -1,10 +1,13 @@
 # capitalism
 
-An agent-based economy that you watch rather than read about. A few thousand units farm, mine,
-haggle, lend, go broke, inherit and breed on a 2048×2048 wrap-around world, and every behaviour
-they have is a number in a genome that mutates at birth. Nobody is told how to act — prices,
-towns, trade routes, credit bubbles and inequality are what is left after the selection pressure
-runs for a few thousand ticks.
+An agent-based economy that you watch rather than read about. Units farm, mine, haggle, lend, go
+broke, inherit and breed on a wrap-around world, and every behaviour they have is a number in a
+genome that mutates at birth. Nobody is told how to act — prices, towns, trade routes, credit
+bubbles and inequality are what is left after the selection pressure runs for a few thousand ticks.
+
+The world is sized at startup. The default is 2,000 units on 2048×2048; `--cap`/`--grid` scale that
+to a continent — a quarter of a million units on 16384×16384 has been run to steady state with every
+invariant intact. See [Scale](#scale).
 
 LuaJIT + raylib, ~1,600 lines, no dependencies beyond the raylib shared library.
 
@@ -16,6 +19,7 @@ LuaJIT + raylib, ~1,600 lines, no dependencies beyond the raylib shared library.
 brew install luajit raylib     # macOS; any LuaJIT 2.1 + raylib 5/6 works
 luajit main.lua                # opens the window
 luajit check.lua               # headless: 5000 ticks, asserts every invariant, prints ticks/sec
+luajit bench.lua               # headless throughput, best of N passes, no assertions
 ```
 
 `main.lua` refuses to open a window until every raylib symbol resolves, the C struct layouts match,
@@ -142,16 +146,28 @@ gradient. Press `S` to drop one wherever the mouse is; `--shock-every=0` turns t
 Both binaries take the same world knobs; `--help` prints them with defaults.
 
 ```
---pop --money --artisans --yield --toolrate --mut --estate-tax
---shock-every --stubborn-founders --stubborn-birth
+--cap --grid --cell --compact-every                      world size and memory layout
+--pop --money --artisans --yield --toolrate --mut        economy
+--estate-tax --shock-every --stubborn-founders --stubborn-birth
 ```
 
+`--cap` is the hard population ceiling (a power of two), `--grid` the cells per side (a power of
+two), `--cell` the cell size in world units — which is also the interaction radius. The world is
+`grid × cell` across, so `--grid=1024` is a 16384×16384 map. Everything is allocated from these at
+`init()`, so memory is fixed from the moment it returns: about 750 bytes per unit slot plus 40
+bytes per cell — 427MB measured for `--cap=524288 --grid=1024`.
+
 `main.lua` adds `--seed --speed --shot --width --height --zoom --pick --no-selftest`.
-`check.lua` adds `--ticks --seed --fast`. Unknown flags, non-numbers and out-of-range values exit 2.
+`check.lua` adds `--ticks --seed --fast`. `bench.lua` adds `--ticks --warm --passes --seed`.
+Unknown flags, non-numbers and out-of-range values exit 2.
 
 ## How a tick works
 
-1. **Grid** — counting sort of everyone into 16×16 cells, so neighbour lookups are O(1).
+0. **Grid** — counting sort of the live set into `cell` × `cell` buckets, so neighbour lookups are
+   O(1). Every `--compact-every` ticks the units are then renumbered into that cell order and every
+   reference to them (loans, heirs, the live list, the UI selection) is remapped, so the per-unit
+   gathers that follow walk memory forwards instead of jumping around an array far larger than cache.
+   Slot identity carries no economic state, so this changes nothing but the addresses.
 2. **Produce** — food and tools from the local field × labour × capital, divided by crowding.
    Splitting effort between the two is penalised (squared shares), so specialising pays.
 3. **Scan** — each unit looks at its cell neighbourhood once: who is selling, who is rich, who is kin.
@@ -168,6 +184,43 @@ Both binaries take the same world knobs; `--help` prints them with defaults.
 **Money is closed and exact.** It is stored as integer-valued doubles and every transfer is floored,
 so `sum(money) + sum(escrow)` is the same number on tick 1 and tick 100,000. Only food and tools are
 created and destroyed. That invariant is what `check.lua` exists to defend.
+
+## Scale
+
+Everything is a flat FFI array sized at `init()`, so the only ceiling is memory. Measured on an
+M-series laptop, LuaJIT 2.1, single-threaded, assertions off (`bench.lua`, best of 3 passes):
+
+| world | cap | steady-state pop | ms/tick | ticks/s | unit-ticks/s |
+|---|---|---|---|---|---|
+| 2048² (default) | 16,384 | ~2,000 | 1.6 | 620 | 1.36M |
+| 8192² | 262,144 | ~126,000 | 143 | 7.0 | 0.92M |
+| 16384² | 524,288 | ~276,000 | 285 | 3.5 | 0.91M |
+
+Cost per unit depends on how clustered the population is, not just its size: a freshly seeded
+16384² world ticks in ~40ms because everyone is spread thin, and slows as towns condense and each
+unit acquires neighbours. The table is steady state, which is the pessimistic end.
+
+```sh
+luajit bench.lua --cap=524288 --grid=1024 --pop=200000 --ticks=25
+luajit main.lua  --cap=262144 --grid=512  --pop=100000     # watchable
+```
+
+A continent runs, but it runs at a few ticks per second, not at 60. Roughly half of a tick is
+neighbour discovery — about twelve candidates per unit, of which a third are inside the interaction
+radius — and that half is memory-latency bound, not compute bound. The profiler reports ~94% of the
+tick executing compiled traces with no aborts, so there is no interpreter overhead left to reclaim.
+
+Things that were tried and **lost**, so they are not in the code:
+
+- Splitting the six field propagations into one pass each. They share their index arithmetic; six
+  passes cost six times as much.
+- Holding the scan accumulators in registers per unit instead of read-modify-writing `SC`. The inner
+  loop is only ~7 iterations, and trace-entry overhead ate the saving.
+- Rejecting out-of-range candidates in the consumer instead of the producer. It moves the work, it
+  does not remove it.
+
+What would actually move the needle next is threads — the tick decomposes cleanly by cell — and
+LuaJIT has no shared-memory parallel loop. That is the argument for a C kernel, not the language.
 
 ## Genes
 
@@ -198,6 +251,8 @@ make check    # headless audit
 make lint     # luacheck
 make fmt      # stylua
 make ci       # fmt-check + lint + check
+make bench    # throughput, default world
+make bench-big # throughput, 16384x16384 continent
 make shots    # regenerate docs/*.png
 ```
 
@@ -207,9 +262,19 @@ code. Linting is [luacheck](https://github.com/lunarmodules/luacheck) with `.lua
 (`std = "luajit"`, so `ffi`, `bit` and `jit` are known globals). Both come from Homebrew:
 `brew install stylua luacheck`. The tree is warning-free; keep it that way.
 
-The simulation asserts aggressively. `sim.debug = true` turns on per-phase conservation checks inside
-`tick()`, `sim.validate()` reconciles every unit, loan and free-list against the ledger, and
-`sim.selftest()` runs the same seed twice and compares fingerprints. `check.lua` runs all three.
+The simulation asserts aggressively, in four tiers, so a production run pays for none of them:
+
+| tier | runs | cost |
+|---|---|---|
+| static checks on constants and struct layout | once per `init()` | free |
+| per-phase conservation checks | only when `sim.debug` is true | 1.1× |
+| `sim.validate()` — every unit, loan and free-list reconciled against the ledger | only when called | O(cap) |
+| `sim.selftest()` — same seed twice, fingerprints compared | `main.lua` startup unless `--no-selftest` | fixed, always on the default small world |
+
+There are no assertions inside any per-unit loop; the `if dbg then` branches sit once per phase.
+`check.lua` turns all of it on (`--fast` turns the per-phase tier off); `bench.lua` and `main.lua`
+leave it off. `validate()` uses FFI scratch rather than Lua tables so the full audit still runs at
+continental cap.
 
 [`PLAN.md`](PLAN.md) has the design rationale, the performance traps (LuaJIT trace aborts, raylib
 struct-by-value FFI calls), the bugs the assertions caught, and what is still broken — chiefly that
