@@ -1338,6 +1338,7 @@ function M.tick_count() return tick end
 
 -- renderer walks these instead of all CAP slots
 function M.live_set() return live, nlive end
+function M.fields() return opp, sup, dem, res end
 
 -- the biography of one slot, or nil when --track is off
 function M.bio(i) return trk and i >= 0 and TR[i] or nil end

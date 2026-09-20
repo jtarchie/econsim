@@ -150,9 +150,9 @@ local function tint(u, i)
   return u.cr, u.cg, u.cb
 end
 
-local function draw_world()
+local function draw_tile(ox, oy)
   rl.rlPushMatrix()
-  rl.rlTranslatef(cam_x, cam_y, 0)
+  rl.rlTranslatef(cam_x + ox * W * zoom, cam_y + oy * W * zoom, 0)
   rl.rlScalef(zoom, zoom, 1)
 
   rl.rlSetTexture(land.id)
@@ -177,13 +177,15 @@ local function draw_world()
       local l = L[li]
       if l.active == 1 then
         local a, b = U[l.lender], U[l.borrower]
-        if abs(a.x - b.x) < W / 2 and abs(a.y - b.y) < W / 2 then
-          rl.rlCheckRenderBatchLimit(2)
-          rl.rlColor4ub(a.cr, a.cg, a.cb, min(220, 50 + l.owed / 10))
-          rl.rlVertex2f(a.x, a.y)
-          rl.rlColor4ub(a.cr, a.cg, a.cb, 10)
-          rl.rlVertex2f(b.x, b.y)
-        end
+        -- draw to the nearest image of the borrower, not its stored coordinates: a loan across the seam is short, and the old guard dropped 3% of them unseen
+        local dx, dy = b.x - a.x, b.y - a.y
+        dx = dx > W / 2 and dx - W or (dx < -W / 2 and dx + W or dx)
+        dy = dy > W / 2 and dy - W or (dy < -W / 2 and dy + W or dy)
+        rl.rlCheckRenderBatchLimit(2)
+        rl.rlColor4ub(a.cr, a.cg, a.cb, min(220, 50 + l.owed / 10))
+        rl.rlVertex2f(a.x, a.y)
+        rl.rlColor4ub(a.cr, a.cg, a.cb, 10)
+        rl.rlVertex2f(a.x + dx, a.y + dy)
       end
     end
     rl.rlEnd()
@@ -226,13 +228,10 @@ local function draw_world()
   rl.rlBegin(RL_QUADS)
   for k = 0, sim.NFLASH - 1 do
     local f = flashes[k]
-    if f.ttl > 0 then
-      f.ttl = f.ttl - 1
-      if show_flash then
-        local c = FLASH_RGB[f.kind]
-        rl.rlColor4ub(c[1], c[2], c[3], f.ttl * 6)
-        quad(f.x, f.y, (f.kind == 0 and 3 or 6) + (24 - f.ttl) * 0.5)
-      end
+    if f.ttl > 0 and show_flash then
+      local c = FLASH_RGB[f.kind]
+      rl.rlColor4ub(c[1], c[2], c[3], f.ttl * 6)
+      quad(f.x, f.y, (f.kind == 0 and 3 or 6) + (24 - f.ttl) * 0.5)
     end
   end
   local sel = sim.selected
@@ -243,6 +242,24 @@ local function draw_world()
   rl.rlEnd()
   rl.rlSetTexture(0)
   rl.rlPopMatrix()
+end
+
+-- the world is a torus and has no edges, so drawing one square implied a boundary that is not there: every visible copy is drawn, and a town on the seam is one town again
+local function draw_world()
+  for k = 0, sim.NFLASH - 1 do
+    local f = flashes[k]
+    if f.ttl > 0 then f.ttl = f.ttl - 1 end
+  end
+  local span = W * zoom
+  local i0, i1 = floor(-cam_x / span), floor((rl.GetScreenWidth() - cam_x) / span)
+  local j0, j1 = floor(-cam_y / span), floor((rl.GetScreenHeight() - cam_y) / span)
+  -- a cap only bites on a small world zoomed right out; a large one spans the screen in one copy, so this never costs a continent anything
+  i1, j1 = min(i1, i0 + 4), min(j1, j0 + 4)
+  for i = i0, i1 do
+    for j = j0, j1 do
+      draw_tile(i, j)
+    end
+  end
 end
 
 local function spark(series, x, y, w, h, r, g, b, lo, hi)
@@ -409,7 +426,8 @@ local function draw_caption()
 end
 
 local function pick(mx, my)
-  local wx, wy = (mx - cam_x) / zoom, (my - cam_y) / zoom
+  -- the click may land on any copy of the world, so fold it back onto the one the units live in
+  local wx, wy = (mx - cam_x) / zoom % W, (my - cam_y) / zoom % W
   local best, best_d = -1, (14 / zoom) ^ 2
   for s = 0, nlive - 1 do
     local i = live[s]

@@ -36,6 +36,10 @@ and the simulation reproduces a known fingerprint from a fixed seed. If it start
 ore (tools). They mostly do not overlap, which is the central tension of the whole model: the people
 who can make tools do not live where the food is.
 
+**The world wraps** — it is a torus, with no edge and no corner, and the fertility field is periodic
+so it tiles seamlessly. The view draws every copy of the world the camera can see, so panning never
+runs out of map and a town sitting on the seam is drawn as one town rather than two halves.
+
 **Each dot is one person.** Its colour is a fixed projection of its 20-gene genome onto a hue, so
 similar colours mean similar strategies and a spreading colour is a strategy winning. Its radius is
 net worth relative to the median (money + loans out − debt + goods and capital at market prices),
